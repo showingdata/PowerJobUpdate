@@ -56,6 +56,26 @@
             <groupId>tech.powerjob</groupId>
             <artifactId>powerjob-client</artifactId>
         </dependency>
+
+        <!-- Redis：可选，仅 concurrency.limiter-type=redis 时需要；排除 Lettuce 避免与 Vert.x Netty 版本冲突 -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-data-redis</artifactId>
+            <version>${springboot.version}</version>
+            <optional>true</optional>
+            <exclusions>
+                <exclusion>
+                    <groupId>io.lettuce</groupId>
+                    <artifactId>lettuce-core</artifactId>
+                </exclusion>
+            </exclusions>
+        </dependency>
+        <dependency>
+            <groupId>redis.clients</groupId>
+            <artifactId>jedis</artifactId>
+            <version>3.8.0</version>
+            <optional>true</optional>
+        </dependency>
     </dependencies>
 
     <!-- SpringBoot maven plugin -->

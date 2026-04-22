@@ -24,6 +24,10 @@ import tech.powerjob.server.persistence.remote.model.InstanceInfoDO;
 import tech.powerjob.server.persistence.remote.model.JobInfoDO;
 import tech.powerjob.server.persistence.remote.model.UserInfoDO;
 import tech.powerjob.server.persistence.remote.repository.InstanceInfoRepository;
+import tech.powerjob.common.enums.CallbackEventType;
+import tech.powerjob.common.model.CallbackNotification;
+import tech.powerjob.server.core.callback.CallbackService;
+import tech.powerjob.server.extension.ConcurrencyLimiterService;
 import tech.powerjob.server.remote.aware.TransportServiceAware;
 import tech.powerjob.server.remote.transporter.impl.ServerURLFactory;
 import tech.powerjob.server.remote.transporter.TransportService;
@@ -59,6 +63,18 @@ public class InstanceManager implements TransportServiceAware {
     private final WorkerClusterQueryService workerClusterQueryService;
 
     /**
+     * 并发限制器，未启用时为 null
+     */
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private ConcurrencyLimiterService concurrencyLimiterService;
+
+    /**
+     * 回调服务，未启用时为 null
+     */
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private CallbackService callbackService;
+
+    /**
      * 基础组件通过 aware 注入，避免循环依赖
      */
     private TransportService transportService;
@@ -89,6 +105,10 @@ public class InstanceManager implements TransportServiceAware {
             log.warn("[InstanceManager-{}] TaskTrackerAddress is empty, server will wait then acquire again!", instanceId);
             CommonUtils.easySleep(277);
             instanceInfo = instanceInfoRepository.findByInstanceId(instanceId);
+            if (instanceInfo == null || StringUtils.isEmpty(instanceInfo.getTaskTrackerAddress())) {
+                log.warn("[InstanceManager-{}] TaskTrackerAddress is still empty after waiting, discard this report.", instanceId);
+                return;
+            }
         }
 
         int originStatus = instanceInfo.getStatus();
@@ -136,6 +156,10 @@ public class InstanceManager implements TransportServiceAware {
                 log.info("[InstanceManager-{}] receive frequent task alert req,time:{},content:{}", instanceId, req.getReportTime(), req.getAlertContent());
                 alert(instanceId, req.getAlertContent());
             }
+            // 生命周期结束，收尾（释放许可、触发回调等）
+            if (instanceInfo.getStatus() == InstanceStatus.SUCCEED.getV()) {
+                processFinishedInstance(instanceId, instanceInfo.getWfInstanceId(), InstanceStatus.SUCCEED, req.getResult());
+            }
             return;
         }
         // 更新运行次数
@@ -157,6 +181,11 @@ public class InstanceManager implements TransportServiceAware {
             if (instanceInfo.getRunningTimes() <= jobInfo.getInstanceRetryNum()) {
 
                 log.info("[InstanceManager-{}] instance execute failed but will take the {}th retry.", instanceId, instanceInfo.getRunningTimes());
+
+                // TODO 定制开发 新添加逻辑 释放并发许可：重试会重新走 dispatch 流程，届时重新获取；不释放会导致旧 Worker 的 slot 永久泄漏
+                if (concurrencyLimiterService != null) {
+                    concurrencyLimiterService.release(instanceId, instanceInfo.getTaskTrackerAddress());
+                }
 
                 // 延迟10S重试（由于重试不改变 instanceId，如果派发到同一台机器，上一个 TaskTracker 还处于资源释放阶段，无法创建新的TaskTracker，任务失败）
                 instanceInfo.setExpectedTriggerTime(System.currentTimeMillis() + 10000);
@@ -207,6 +236,13 @@ public class InstanceManager implements TransportServiceAware {
 
         log.info("[Instance-{}] process finished, final status is {}.", instanceId, status.name());
 
+        // 释放并发许可（实例进入终态）
+        if (concurrencyLimiterService != null) {
+            InstanceInfoDO info = instanceInfoRepository.findByInstanceId(instanceId);
+            String workerAddress = info != null ? info.getTaskTrackerAddress() : null;
+            concurrencyLimiterService.release(instanceId, workerAddress);
+        }
+
         // 上报日志数据
         HashedWheelTimerHolder.INACCURATE_TIMER.schedule(() -> instanceLogService.sync(instanceId), 60, TimeUnit.SECONDS);
 
@@ -220,8 +256,39 @@ public class InstanceManager implements TransportServiceAware {
         if (status == InstanceStatus.FAILED) {
             alert(instanceId, result);
         }
+        // 回调通知
+        if (callbackService != null) {
+            sendFinishedCallback(instanceId, status, result);
+        }
         // 主动移除缓存，减小内存占用
         instanceMetadataService.invalidateJobInfo(instanceId);
+    }
+
+    /**
+     * 通用结束任务通知
+     * @param instanceId 任务实例ID
+     * @param status 任务状态
+     * @param result 任务执行结果
+     */
+    private void sendFinishedCallback(Long instanceId, InstanceStatus status, String result) {
+        try {
+            InstanceInfoDO instanceInfo = instanceInfoRepository.findByInstanceId(instanceId);
+            if (instanceInfo == null) {
+                return;
+            }
+            JobInfoDO jobInfo = instanceMetadataService.fetchJobInfoByInstanceId(instanceId);
+            CallbackEventType eventType = status == InstanceStatus.SUCCEED ? CallbackEventType.TASK_COMPLETED : CallbackEventType.TASK_FAILED;
+            CallbackNotification notification = CallbackNotification.create(eventType, status == InstanceStatus.SUCCEED ? "任务执行成功" : "任务执行失败")
+                    .setAppId(instanceInfo.getAppId())
+                    .setJobId(instanceInfo.getJobId())
+                    .setJobName(jobInfo != null ? jobInfo.getJobName() : null)
+                    .setInstanceId(instanceId)
+                    .setWorkerAddress(instanceInfo.getTaskTrackerAddress())
+                    .setDetails(java.util.Collections.singletonMap("result", result));
+            callbackService.sendCallback(instanceInfo.getAppId(), notification);
+        } catch (Exception e) {
+            log.warn("[InstanceManager-{}] send callback failed", instanceId, e);
+        }
     }
 
     private void alert(Long instanceId, String alertContent) {

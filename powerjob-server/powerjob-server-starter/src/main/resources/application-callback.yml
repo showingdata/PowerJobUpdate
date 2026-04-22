@@ -1,0 +1,33 @@
+# PowerJob 并发限制和回调通知配置示例
+powerjob:
+  server:
+    # 全局并发限制配置
+    concurrency:
+      # 是否启用全局并发限制（默认false）
+      enabled: true
+      # 全局最大并发任务数（默认1000）
+      max-global-concurrency: 3
+      # 单 Worker 最大并发任务数（默认100） 单 Server + Local 模式下建议修改成 0
+      # tryAcquireWorker 确实和已有机制高度重叠，实际价值有限，filterOverloadWorker + Worker 自拒绝已经够用了
+      # 多 Server + Redis 模式下
+      # Server A 和 Server B 同时往 Worker X 派发，Worker 心跳只有 10 秒一次，两个 Server 看到的 overload 状态可能都是 false，
+      # 但实际上两者加起来已经超过 Worker 的承载上限。Redis 计数器让两个 Server 共享同一个 Worker 的派发计数，能精确拦截。
+      max-worker-concurrency: 0
+      # 超限策略: REJECT(直接拒绝)  QUEUE(排队等待)
+      over-limit-policy: REJECT
+      # 排队超时时间(秒)，仅 QUEUE 模式有效
+      queue-timeout-seconds: 60
+      # 限制器类型: local(本地内存) redis(分布式)
+      limiter-type: local
+    # 回调通知配置
+    callback:
+      # 是否启用回调通知（默认false）
+      enabled: true
+      # 异步执行线程池大小
+      thread-pool-size: 10
+      # 默认超时时间(毫秒)
+      default-timeout-ms: 5000
+      # 默认重试次数
+      default-retry-times: 3
+      # 回调队列大小
+      queue-size: 1000

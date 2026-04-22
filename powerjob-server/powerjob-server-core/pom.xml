@@ -20,6 +20,12 @@
 
     <dependencies>
         <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter-api</artifactId>
+            <version>5.9.0</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
             <groupId>tech.powerjob</groupId>
             <artifactId>powerjob-server-extension</artifactId>
         </dependency>
@@ -34,6 +40,26 @@
         <dependency>
             <groupId>tech.powerjob</groupId>
             <artifactId>powerjob-server-persistence</artifactId>
+        </dependency>
+
+        <!-- Redis：编译期需要 StringRedisTemplate，运行时由 server-starter 提供；排除 Lettuce 避免 Netty 版本冲突 -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-data-redis</artifactId>
+            <version>${springboot.version}</version>
+            <optional>true</optional>
+            <exclusions>
+                <exclusion>
+                    <groupId>io.lettuce</groupId>
+                    <artifactId>lettuce-core</artifactId>
+                </exclusion>
+            </exclusions>
+        </dependency>
+        <dependency>
+            <groupId>redis.clients</groupId>
+            <artifactId>jedis</artifactId>
+            <version>3.8.0</version>
+            <optional>true</optional>
         </dependency>
     </dependencies>
 

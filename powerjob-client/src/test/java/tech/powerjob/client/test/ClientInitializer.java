@@ -17,6 +17,6 @@ public class ClientInitializer {
 
     @BeforeAll
     public static void initClient() throws Exception {
-        powerJobClient = new PowerJobClient(Lists.newArrayList("127.0.0.1:7700", "127.0.0.1:7701"), "powerjob-worker-samples", "powerjob123");
+        powerJobClient = new PowerJobClient(Lists.newArrayList("127.0.0.1:7700"), "common-test", "123456");
     }
 }

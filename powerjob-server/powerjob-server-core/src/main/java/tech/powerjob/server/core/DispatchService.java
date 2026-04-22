@@ -5,21 +5,24 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.lang3.StringUtils;
 import org.springframework.beans.BeanUtils;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import org.springframework.util.CollectionUtils;
 import tech.powerjob.common.RemoteConstant;
 import tech.powerjob.common.SystemInstanceResult;
-import tech.powerjob.common.enums.ExecuteType;
-import tech.powerjob.common.enums.InstanceStatus;
-import tech.powerjob.common.enums.ProcessorType;
-import tech.powerjob.common.enums.TimeExpressionType;
+import tech.powerjob.common.enums.*;
+import tech.powerjob.common.model.CallbackNotification;
+import tech.powerjob.common.model.ConcurrencyPermit;
 import tech.powerjob.common.request.ServerScheduleJobReq;
+import tech.powerjob.server.core.callback.CallbackService;
 import tech.powerjob.remote.framework.base.URL;
 import tech.powerjob.server.common.Holder;
 import tech.powerjob.server.common.module.WorkerInfo;
+import tech.powerjob.server.common.constants.ConcurrencyProperties;
 import tech.powerjob.server.core.instance.InstanceManager;
 import tech.powerjob.server.core.instance.InstanceMetadataService;
 import tech.powerjob.server.core.lock.UseCacheLock;
+import tech.powerjob.server.extension.ConcurrencyLimiterService;
 import tech.powerjob.server.persistence.remote.model.InstanceInfoDO;
 import tech.powerjob.server.persistence.remote.model.JobInfoDO;
 import tech.powerjob.server.persistence.remote.repository.InstanceInfoRepository;
@@ -62,13 +65,32 @@ public class DispatchService {
     private final TaskTrackerSelectorService taskTrackerSelectorService;
 
     /**
+     * 并发限制器，未启用时为 null
+     */
+    @Autowired(required = false)
+    private ConcurrencyLimiterService concurrencyLimiterService;
+
+    @Autowired(required = false)
+    private ConcurrencyProperties concurrencyProperties;
+
+    /**
+     * 回调服务，未启用时为 null
+     */
+    @Autowired(required = false)
+    private CallbackService callbackService;
+
+    /**
      * 异步重新派发
      *
      * @param instanceId 实例 ID
      */
     @UseCacheLock(type = "processJobInstance", key = "#instanceId", concurrencyLevel = 1024)
     public void redispatchAsync(Long instanceId, int originStatus) {
-        // 将状态重置为等待派发
+        // 重派发前释放旧许可：release 对未持有许可的实例是幂等 no-op，无需按 originStatus 区分
+        // 覆盖 WAITING_WORKER_RECEIVE / RUNNING 等所有可能持有许可的状态，避免 Worker 计数泄漏
+        if (concurrencyLimiterService != null) {
+            concurrencyLimiterService.release(instanceId, null);
+        }
         instanceInfoRepository.updateStatusAndGmtModifiedByInstanceIdAndOriginStatus(instanceId, originStatus, InstanceStatus.WAITING_DISPATCH.getV(), new Date());
     }
 
@@ -76,7 +98,10 @@ public class DispatchService {
      * 异步批量重新派发，不加锁
      */
     public void redispatchBatchAsyncLockFree(List<Long> instanceIdList, int originStatus) {
-        // 将状态重置为等待派发
+        // 重派发前释放旧许可：release 对未持有许可的实例是幂等 no-op，无需按 originStatus 区分
+        if (concurrencyLimiterService != null) {
+            instanceIdList.forEach(id -> concurrencyLimiterService.release(id, null));
+        }
         instanceInfoRepository.updateStatusAndGmtModifiedByInstanceIdListAndOriginStatus(instanceIdList, originStatus, InstanceStatus.WAITING_DISPATCH.getV(), new Date());
     }
 
@@ -163,8 +188,31 @@ public class DispatchService {
             // 直接取消派发，减少一次数据库 io
             overloadOptional.ifPresent(booleanHolder -> booleanHolder.set(true));
             log.warn("[Dispatcher-{}|{}] cancel to dispatch job due to all worker is overload", jobId, instanceId);
+            // 此处无需 release：全局许可尚未 acquire，无需归还
+            // 回调通知
+            if (callbackService != null) {
+                try {
+                    CallbackNotification notification = CallbackNotification.create(CallbackEventType.WORKER_OVERLOAD, "all workers are overloaded")
+                            .setAppId(instanceInfo.getAppId())
+                            .setJobId(jobId)
+                            .setJobName(jobInfo.getJobName())
+                            .setInstanceId(instanceId);
+                    callbackService.sendCallback(instanceInfo.getAppId(), notification);
+                } catch (Exception e) {
+                    log.warn("[Dispatcher-{}|{}] send workerOverload callback failed", jobId, instanceId, e);
+                }
+            }
             return;
         }
+        // 确认有可用 Worker 后再获取全局并发许可，避免无 Worker 时的无效 acquire/release
+        if (concurrencyLimiterService != null) {
+            ConcurrencyPermit globalPermit = concurrencyLimiterService.tryAcquireGlobal(instanceId);
+            if (!globalPermit.isAcquired()) {
+                handleOverLimit(jobInfo, instanceId, instanceInfo, globalPermit, now, current);
+                return;
+            }
+        }
+
         List<String> workerIpList = suitableWorkers.stream().map(WorkerInfo::getAddress).collect(Collectors.toList());
         // 构造任务调度请求
         ServerScheduleJobReq req = constructServerScheduleJobReq(jobInfo, instanceInfo, workerIpList);
@@ -172,6 +220,17 @@ public class DispatchService {
         // 发送请求（不可靠，需要一个后台线程定期轮询状态）
         WorkerInfo taskTracker = taskTrackerSelectorService.select(jobInfo, instanceInfo, suitableWorkers);
         String taskTrackerAddress = taskTracker.getAddress();
+
+        // Worker 级别并发限制检查
+        if (concurrencyLimiterService != null) {
+            ConcurrencyPermit workerPermit = concurrencyLimiterService.tryAcquireWorker(taskTrackerAddress, instanceId);
+            if (!workerPermit.isAcquired()) {
+                // 释放刚才获取的全局许可
+                concurrencyLimiterService.release(instanceId, null);
+                handleOverLimit(jobInfo, instanceId, instanceInfo, workerPermit, now, current);
+                return;
+            }
+        }
 
         URL workerUrl = ServerURLFactory.dispatchJob2Worker(taskTrackerAddress);
         transportService.tell(taskTracker.getProtocol(), workerUrl, req);
@@ -183,11 +242,69 @@ public class DispatchService {
         instanceMetadataService.loadJobInfo(instanceId, jobInfo);
     }
 
+    private void handleOverLimit(JobInfoDO jobInfo, Long instanceId, InstanceInfoDO instanceInfo, ConcurrencyPermit permit, Date now, long current) {
+        String reason = String.format("[ConcurrencyLimit] %s: current=%d, max=%d", permit.getReason().getDesc(), permit.getCurrentConcurrency(), permit.getMaxConcurrency());
+        ConcurrencyProperties.OverLimitPolicy policy = concurrencyProperties != null ? concurrencyProperties.getOverLimitPolicy() : ConcurrencyProperties.OverLimitPolicy.REJECT;
+        if (policy == ConcurrencyProperties.OverLimitPolicy.QUEUE && !isQueueTimeout(instanceInfo)) {
+            // QUEUE 策略：保持 WAITING_DISPATCH 状态，等待下次调度轮重试；实例未终止，不发回调
+            log.warn("[Dispatcher-{}|{}] concurrency over limit, queued for retry. reason: {}", jobInfo.getId(), instanceId, reason);
+        } else {
+            // REJECT 策略，或 QUEUE 超过最大等待时长：直接标记为失败
+            if (policy == ConcurrencyProperties.OverLimitPolicy.QUEUE) {
+                reason = reason + " [queue timeout]";
+                log.warn("[Dispatcher-{}|{}] concurrency over limit, queue wait exceeded maxQueueWaitMs, instance rejected. reason: {}", jobInfo.getId(), instanceId, reason);
+            } else {
+                log.warn("[Dispatcher-{}|{}] concurrency over limit, instance rejected. reason: {}", jobInfo.getId(), instanceId, reason);
+            }
+            instanceInfoRepository.update4TriggerFailed(instanceId, FAILED.getV(), current, current, RemoteConstant.EMPTY_ADDRESS, reason, now);
+            instanceManager.processFinishedInstance(instanceId, instanceInfo.getWfInstanceId(), FAILED, reason);
+            // 实例真正进入终态才发回调
+            if (callbackService != null) {
+                try {
+                    CallbackEventType eventType = permit.getReason() == OverLimitReason.GLOBAL_LIMIT_EXCEEDED ? CallbackEventType.GLOBAL_LIMIT_EXCEEDED : CallbackEventType.TASK_REJECTED;
+                    CallbackNotification notification = CallbackNotification.create(eventType, reason)
+                            .setAppId(instanceInfo.getAppId())
+                            .setJobId(jobInfo.getId())
+                            .setJobName(jobInfo.getJobName())
+                            .setInstanceId(instanceId);
+                    callbackService.sendCallback(instanceInfo.getAppId(), notification);
+                } catch (Exception e) {
+                    log.warn("[Dispatcher-{}|{}] send overLimit callback failed", jobInfo.getId(), instanceId, e);
+                }
+            }
+        }
+    }
+
+    /**
+     * 核心逻辑：QUEUE 策略下实例不会立刻被拒绝，而是留在 WAITING_DISPATCH 等下次调度重试。isQueueTimeout 用来判断这个实例等了多久，超过 maxQueueWaitMs
+     * 就降级为 REJECT，避免无限积压。
+     * @param instanceInfo
+     * @return
+     * 定时任务（Cron/固定频率）：expectedTriggerTime 是调度器提前算好的触发时间点，用它作为起点更准确——从"本来应该跑"的时刻开始计算等待时长。
+     * - API 触发：没有预计触发时间，expectedTriggerTime 为 0 或负数，改用 gmtCreate（实例创建时间）作为起点。
+     */
+    private boolean isQueueTimeout(InstanceInfoDO instanceInfo) {
+        // concurrencyProperties 未注入（并发限制器未启用）→ 永不超时
+        if (concurrencyProperties == null) {
+            return false;
+        }
+        // maxWait < 0 表示用户配置了"无限等待"→ 永不超时
+        long maxWait = concurrencyProperties.getMaxQueueWaitMs();
+        if (maxWait < 0) {
+            return false;
+        }
+        // 计算实例"入队时间"：
+        // expectedTriggerTime > 0：说明是定时触发的任务，用预计触发时间作为入队时间
+        // expectedTriggerTime <= 0：说明是 API 立即触发的任务，用创建时间作为入队时间
+        long enqueueTime = instanceInfo.getExpectedTriggerTime() > 0 ? instanceInfo.getExpectedTriggerTime() : instanceInfo.getGmtCreate().getTime();
+        return System.currentTimeMillis() - enqueueTime > maxWait;
+    }
+
     private List<WorkerInfo> filterOverloadWorker(List<WorkerInfo> suitableWorkers) {
 
         List<WorkerInfo> res = new ArrayList<>(suitableWorkers.size());
         for (WorkerInfo suitableWorker : suitableWorkers) {
-            if (suitableWorker.overload()){
+            if (suitableWorker.overload()) {
                 continue;
             }
             res.add(suitableWorker);

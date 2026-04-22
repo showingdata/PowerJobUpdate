@@ -122,6 +122,8 @@ public interface InstanceInfoRepository extends JpaRepository<InstanceInfoDO, Lo
 
     InstanceInfoDO findByInstanceId(long instanceId);
 
+    List<InstanceInfoDO> findByStatusIn(List<Integer> statuses);
+
     /* --数据统计-- */
 
     @Query(value = "select count(*) from InstanceInfoDO where appId = ?1 and status = ?2")

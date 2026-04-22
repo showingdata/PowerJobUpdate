@@ -48,6 +48,8 @@
         <!-- skip this module when deploying. -->
         <maven.deploy.skip>true</maven.deploy.skip>
 
+        <maven-surefire-plugin.version>2.22.2</maven-surefire-plugin.version>
+
         <groovy.version>3.0.10</groovy.version>
         <cron-utils.version>9.2.1</cron-utils.version>
 
@@ -333,6 +335,11 @@
                 <configuration>
                     <skip>true</skip>
                 </configuration>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <version>${maven-surefire-plugin.version}</version>
             </plugin>
         </plugins>
     </build>

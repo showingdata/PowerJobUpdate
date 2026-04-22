@@ -1,0 +1,425 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>PowerJob 全局并发控制执行流程图</title>
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: "Microsoft YaHei", "PingFang SC", sans-serif;
+            background: #f5f7fa;
+            color: #333;
+            padding: 20px;
+        }
+        .header {
+            text-align: center;
+            margin-bottom: 30px;
+            padding: 20px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border-radius: 12px;
+        }
+        .header h1 { font-size: 28px; margin-bottom: 8px; }
+        .header p { font-size: 14px; opacity: 0.9; }
+        .section {
+            background: white;
+            border-radius: 12px;
+            padding: 24px;
+            margin-bottom: 20px;
+            box-shadow: 0 2px 12px rgba(0,0,0,0.08);
+            page-break-inside: avoid;
+        }
+        .section h2 {
+            font-size: 20px;
+            margin-bottom: 16px;
+            padding-bottom: 8px;
+            border-bottom: 2px solid #e8ecf1;
+            color: #2c3e50;
+        }
+        .section h3 {
+            font-size: 16px;
+            margin: 12px 0 8px 0;
+            color: #34495e;
+        }
+        .mermaid {
+            display: flex;
+            justify-content: center;
+            margin: 16px 0;
+            overflow-x: auto;
+        }
+        .legend {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+            gap: 12px;
+            margin-top: 16px;
+        }
+        .legend-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 12px;
+            background: #f8f9fb;
+            border-radius: 6px;
+            font-size: 13px;
+        }
+        .legend-dot {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            flex-shrink:: 0;
+        }
+        .table-wrap { overflow-x: auto; }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 13px;
+        }
+        th, td {
+            padding: 10px 12px;
+            text-align: left;
+            border: 1px solid #e8ecf1;
+        }
+        th {
+            background: #f1f3f7;
+            font-weight: 600;
+            color: #2c3e50;
+        }
+        .tag {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-size: 11px;
+            font-weight: 600;
+        }
+        .tag-ok { background: #d4edda; color: #155724; }
+        .tag-warn { background: #fff3cd; color: #856404; }
+        .tag-info { background: #d1ecf1; color: #0c5460; }
+        .footer {
+            text-align: center;
+            padding: 20px;
+            color: #999;
+            font-size: 12px;
+        }
+        @media print {
+            body { background: white; padding: 0; }
+            .section { box-shadow: none; border: 1px solid #ddd; break-inside: avoid; }
+            .header { box-shadow: none; }
+        }
+    </style>
+</head>
+<body>
+
+<div class="header">
+    <h1>PowerJob Server 全局并发控制执行流程图</h1>
+    <p>涵盖：调度入口 → 三层限流 → 超限策略 → 许可生命周期 → 恢复机制 → 双实现对比</p>
+</div>
+
+<!-- ========== Section 1: 总体流程 ========== -->
+<div class="section">
+    <h2>一、任务调度总体流程（DispatchService.dispatch）</h2>
+    <div class="mermaid">
+flowchart TD
+    A["dispatch(jobInfo, instanceId, ...)"] --> B{"instance 已取消?"}
+    B -- 是 --> B1["跳过派发 return"]
+    B -- 否 --> C{"status ≠ WAITING_DISPATCH?"}
+    C -- 是 --> C1["跳过:已派发 return"]
+    C -- 否 --> D{"jobInfo.id == null?"}
+    D -- 是 --> D1["processFinishedInstance FAILED"]
+    D -- 否 --> E{"maxInstanceNum > 0?"}
+
+    E -- 否 --> G["跳过Job级别限制"]
+    E -- 是 --> F{"runningCount >= max?"}
+    F -- 是 --> F1["update4TriggerFailed<br/>processFinishedInstance"]
+    F -- 否 --> G
+
+    G --> H{"concurrencyLimiter<br/>!= null?"}
+    H -- 否 --> M["跳过并发检查"]
+    H -- 是 --> I["tryAcquireGlobal(instanceId)"]
+    I --> J{"permit.isAcquired?"}
+    J -- 否 --> K["handleOverLimit"]
+    J -- 是 --> L["✅ 全局许可获取"]
+
+    L --> M2["geAvailableWorkers"]
+    M --> M2
+    M2 --> M3{"workers为空?"}
+    M3 -- 是 --> M4["FAILED: NO_WORKER_AVAILABLE<br/>processFinishedInstance"]
+    M3 -- 否 --> M5["filterOverloadWorker"]
+    M5 --> M6{"全部超载?"}
+    M6 -- 是 --> M7["release(instanceId, null)<br/>回调 WORKER_OVERLOAD"]
+    M6 -- 否 --> M8["select TaskTracker"]
+
+    M8 --> W1{"concurrencyLimiter<br/>!= null?"}
+    W1 -- 否 --> P1
+    W1 -- 是 --> W2["tryAcquireWorker(addr, instanceId)"]
+    W2 --> W3{"permit.isAcquired?"}
+    W3 -- 否 --> W4["release(instanceId, null)<br/>→ handleOverLimit"]
+    W3 -- 是 --> P1
+
+    P1["transportService.tell<br/>发送调度请求"] --> P2["update4TriggerSucceed<br/>WAITING_WORKER_RECEIVE"]
+    P2 --> P3["loadJobInfo 缓存"]
+
+    style K fill:#fde8e8,stroke:#e74c3c
+    style P1 fill:#d4edda,stroke:#27ae60
+    style L fill:#d4edda,stroke:#27ae60
+    style M7 fill:#fff3cd,stroke:#f39c12
+    style W4 fill:#fde8e8,stroke:#e74c3c
+    style F1 fill:#fde8e8,stroke:#e74c3c
+    style M4 fill:#fde8e8,stroke:#e74c3c
+    style D1 fill:#fde8e8,stroke:#e74c3c
+    </div>
+</div>
+
+<!-- ========== Section 2: 超限策略 ========== -->
+<div class="section">
+    <h2>二、超限处理策略（handleOverLimit）</h2>
+    <div class="mermaid">
+flowchart TD
+    K["handleOverLimit<br/>permit 被拒绝"] --> K1{"policy == QUEUE?"}
+
+    K1 -- 否<br/>REJECT --> K2["REJECT 策略"]
+    K2 --> K2a["update4TriggerFailed FAILED"]
+    K2a --> K2b["processFinishedInstance"]
+    K2b --> K2c["回调通知<br/>GLOBAL_LIMIT_EXCEEDED / TASK_REJECTED"]
+
+    K1 -- 是 --> K3{"isQueueTimeout?"}
+    K3 -- 否 --> K4["QUEUE 策略<br/>保持 WAITING_DISPATCH"]
+    K4 --> K5["等待下次调度轮重试<br/>（每10s由 checkWaitingDispatchInstance 触发）"]
+    K5 --> K6["重新进入 dispatch 流程"]
+
+    K3 -- 是 --> K7["QUEUE 超时降级为 REJECT"]
+    K7 --> K7a["update4TriggerFailed FAILED<br/>reason += ' queue timeout'"]
+    K7a --> K7b["processFinishedInstance"]
+    K7b --> K7c["回调通知"]
+
+    style K2 fill:#fde8e8,stroke:#e74c3c
+    style K4 fill:#d1ecf1,stroke:#3498db
+    style K7 fill:#fff3cd,stroke:#f39c12
+    style K2c fill:#e8daef,stroke:#8e44ad
+    style K7c fill:#e8daef,stroke:#8e44ad
+    </div>
+
+    <h3>isQueueTimeout 判定逻辑</h3>
+    <div class="mermaid">
+flowchart LR
+    Q1["maxQueueWaitMs < 0?"] -- 是 --> Q2["不超时 永远排队"]
+    Q1 -- 否 --> Q3["enqueueTime = max<br/>(expectedTriggerTime, gmtCreate)"]
+    Q3 --> Q4{"now - enqueueTime<br/>> maxQueueWaitMs?"}
+    Q4 -- 是 --> Q5["超时 降级为REJECT"]
+    Q4 -- 否 --> Q6["未超时 继续排队"]
+    style Q5 fill:#fff3cd,stroke:#f39c12
+    style Q6 fill:#d4edda,stroke:#27ae60
+    </div>
+</div>
+
+<!-- ========== Section 3: 许可生命周期 ========== -->
+<div class="section">
+    <h2>三、许可证生命周期（Acquire → Release）</h2>
+    <div class="mermaid">
+flowchart TD
+    ACQ["🟢 Acquire 阶段"] --> ACQ1["tryAcquireGlobal(instanceId)"]
+    ACQ1 --> ACQ2["tryAcquireWorker(addr, instanceId)"]
+    ACQ2 --> ACQ3["dispatch 成功<br/>instance 进入 WAITING_WORKER_RECEIVE"]
+
+    ACQ3 --> RUN["instance 运行中"]
+
+    RUN --> REL["🔴 Release 阶段 - 4条路径"]
+
+    REL --> R1["路径1: 正常完成"]
+    REL --> R2["路径2: 超时重派发"]
+    REL --> R3["路径3: 失败重试"]
+    REL --> R4["路径4: Worker超载/Worker限流拒绝"]
+
+    R1 --> R1a["TaskTracker上报SUCCEED/FAILED<br/>→ processFinishedInstance<br/>→ release(id, workerAddr)"]
+
+    R2 --> R2a["InstanceStatusCheckService检测超时"]
+    R2a --> R2b["WAITING_WORKER_RECEIVE超时<br/>→ redispatchBatchAsyncLockFree<br/>→ release(id, null) 批量"]
+    R2a --> R2c["RUNNING超时<br/>→ redispatchAsync<br/>→ release(id, null)"]
+
+    R3 --> R3a["TaskTracker上报FAILED<br/>且 runningTimes ≤ retryNum"]
+    R3a --> R3b["release(id, taskTrackerAddr)<br/>状态改 WAITING_DISPATCH<br/>→ 重新 dispatch 重新acquire"]
+
+    R4 --> R4a["dispatch中Worker全超载<br/>→ release(id, null) 退全局许可"]
+    R4 --> R4b["tryAcquireWorker被拒<br/>→ release(id, null) 退全局许可"]
+
+    style ACQ fill:#d4edda,stroke:#27ae60
+    style REL fill:#fde8e8,stroke:#e74c3c
+    style R1a fill:#d4edda,stroke:#27ae60
+    style R2b fill:#fff3cd,stroke:#f39c12
+    style R2c fill:#fff3cd,stroke:#f39c12
+    style R3b fill:#d1ecf1,stroke:#3498db
+    style R4a fill:#fde8e8,stroke:#e74c3c
+    style R4b fill:#fde8e8,stroke:#e74c3c
+    </div>
+</div>
+
+<!-- ========== Section 4: 恢复机制 ========== -->
+<div class="section">
+    <h2>四、启动恢复机制（recoverOnStartup）</h2>
+    <div class="mermaid">
+flowchart TD
+    RE1["ApplicationReadyEvent 触发"] --> RE2["查询 DB<br/>status IN WAITING_WORKER_RECEIVE, RUNNING"]
+    RE2 --> RE3{"limiterType?"}
+
+    RE3 -- local --> RE4["跳过恢复<br/>原因: DB包含其他节点实例<br/>会导致计数虚高<br/>重启后从0开始 可短暂超发"]
+
+    RE3 -- redis --> RE5["setIfAbsent RECOVERY_LOCK<br/>分布式锁 TTL=60s"]
+    RE5 --> RE6{"获取锁成功?"}
+    RE6 -- 否 --> RE7["跳过: 其他节点在恢复"]
+
+    RE6 -- 是 --> RE8["doRecover 执行恢复"]
+    RE8 --> RE8a["① DELETE + SADD 重建 globalPermits"]
+    RE8 --> RE8b["② SET globalCount = validCount"]
+    RE8 --> RE8c["③ SCAN + DELETE 旧 worker count keys"]
+    RE8 --> RE8d["④ 重建 inst:worker 映射 (带TTL)<br/>+ 重建 worker count"]
+
+    RE8a --> RE9["释放锁: check-and-delete<br/>只删自己持有的锁"]
+    RE8b --> RE9
+    RE8c --> RE9
+    RE8d --> RE9
+
+    style RE4 fill:#d1ecf1,stroke:#3498db
+    style RE7 fill:#fff3cd,stroke:#f39c12
+    style RE8 fill:#d4edda,stroke:#27ae60
+    </div>
+</div>
+
+<!-- ========== Section 5: 双实现对比 ========== -->
+<div class="section">
+    <h2>五、ConcurrencyLimiterService 双实现对比</h2>
+    <div class="mermaid">
+flowchart LR
+    subgraph LOCAL["LocalConcurrencyLimiterService"]
+        direction TB
+        LG["数据结构<br/>───────────<br/>globalCounter: AtomicInteger<br/>globalPermits: Set&lt;Long&gt;<br/>workerCounters: Map&lt;Str, AtomicInteger&gt;<br/>instanceWorkerMap: Map&lt;Long, Str&gt;"]
+        LG --> LA["tryAcquireGlobal<br/>───────────<br/>add幂等→INCR→超限回滚"]
+        LG --> LB["tryAcquireWorker<br/>───────────<br/>putIfAbsent幂等→INCR→超限回滚"]
+        LG --> LC["release<br/>───────────<br/>remove→DECR→compute缩容"]
+        LG --> LD["recoverOnStartup<br/>───────────<br/>跳过(单节点)"]
+    end
+
+    subgraph REDIS["RedisConcurrencyLimiterService"]
+        direction TB
+        RG["Redis Key 设计<br/>───────────<br/>pj:cl:global:count<br/>pj:cl:global:permits<br/>pj:cl:worker:{addr}:count<br/>pj:cl:inst:{id}:worker"]
+        RG --> RA["SCRIPT_ACQUIRE_GLOBAL<br/>───────────<br/>SISMEMBER幂等→INCR→超限DECR→SADD"]
+        RG --> RB["SCRIPT_ACQUIRE_WORKER<br/>───────────<br/>GET幂等→INCR→超限DECR→SET EX TTL"]
+        RG --> RC["SCRIPT_RELEASE<br/>───────────<br/>SREM→DECR→GET映射→DECR worker→DEL"]
+        RG --> RD["recoverOnStartup<br/>───────────<br/>分布式锁→全量重建"]
+    end
+
+    style LOCAL fill:#e8f4fd,stroke:#3498db
+    style REDIS fill:#fdf2e9,stroke:#e67e22
+    </div>
+</div>
+
+<!-- ========== Section 6: 组件交互 ========== -->
+<div class="section">
+    <h2>六、组件交互关系</h2>
+    <div class="mermaid">
+flowchart TD
+    subgraph CORE["核心调度层"]
+        DS["DispatchService<br/>──────────<br/>dispatch: 三层限流<br/>redispatchAsync: 重派发+release<br/>redispatchBatchAsyncLockFree: 批量重派发<br/>handleOverLimit: REJECT/QUEUE策略"]
+        IM["InstanceManager<br/>──────────<br/>updateStatus: 状态更新+release<br/>processFinishedInstance: 终态处理+release"]
+        ISCS["InstanceStatusCheckService<br/>──────────<br/>checkWaitingDispatchInstance<br/>checkWaitingWorkerReceiveInstance<br/>checkRunningInstance"]
+    end
+
+    subgraph LIMITER["并发限制层"]
+        CLI["«interface»<br/>ConcurrencyLimiterService"]
+        CLI --> LOCAL["LocalConcurrencyLimiterService"]
+        CLI --> REDIS["RedisConcurrencyLimiterService"]
+    end
+
+    subgraph CONFIG["配置层"]
+        CP["ConcurrencyProperties<br/>──────────<br/>enabled / maxGlobalConcurrency<br/>maxWorkerConcurrency / overLimitPolicy<br/>maxQueueWaitMs / instWorkerKeyTtlSeconds<br/>limiterType"]
+        CLC["ConcurrencyLimiterConfiguration<br/>──────────<br/>@ConditionalOnProperty enabled=true<br/>local/redis 条件装配<br/>concurrencyLimiterRecoveryListener"]
+    end
+
+    subgraph CALLBACK["回调层"]
+        CBS["CallbackService"]
+        CBN["CallbackNotification"]
+    end
+
+    DS -->|"tryAcquireGlobal<br/>tryAcquireWorker<br/>release"| CLI
+    IM -->|"release<br/>(正常完成/失败重试)"| CLI
+    ISCS -->|"redispatchAsync<br/>redispatchBatchAsyncLockFree"| DS
+    DS -->|"processFinishedInstance"| IM
+    ISCS -->|"updateFailedInstance<br/>→ processFinishedInstance"| IM
+    DS -->|"sendCallback"| CBS
+    IM -->|"sendCallback"| CBS
+    CLC -->|"创建Bean"| CLI
+    CP -->|"注入配置"| CLC
+    CP -->|"注入配置"| DS
+
+    style CORE fill:#e8f4fd,stroke:#3498db
+    style LIMITER fill:#fdf2e9,stroke:#e67e22
+    style CONFIG fill:#eafaf1,stroke:#27ae60
+    style CALLBACK fill:#f5eef8,stroke:#8e44ad
+    </div>
+</div>
+
+<!-- ========== Section 7: 安全保障清单 ========== -->
+<div class="section">
+    <h2>七、核心安全保障清单</h2>
+    <div class="table-wrap">
+    <table>
+        <thead>
+            <tr><th>#</th><th>安全项</th><th>机制</th><th>状态</th></tr>
+        </thead>
+        <tbody>
+            <tr><td>1</td><td>许可泄漏防护</td><td>redispatch 先 release 再改 DB；release 对未持有许可的实例幂等 no-op</td><td><span class="tag tag-ok">✓</span></td></tr>
+            <tr><td>2</td><td>全局级幂等保护</td><td>Local: globalPermits.add() / Redis: Lua SISMEMBER</td><td><span class="tag tag-ok">✓</span></td></tr>
+            <tr><td>3</td><td>Worker级幂等保护</td><td>Local: putIfAbsent / Redis: Lua GET KEYS[2]</td><td><span class="tag tag-ok">✓</span></td></tr>
+            <tr><td>4</td><td>Worker计数器缩容</td><td>remaining==0 时 compute 条件删除</td><td><span class="tag tag-ok">✓</span></td></tr>
+            <tr><td>5</td><td>Redis恢复多节点竞态</td><td>分布式锁 + check-and-delete 释放锁</td><td><span class="tag tag-ok">✓</span></td></tr>
+            <tr><td>6</td><td>Redis恢复完整重建</td><td>permits + inst:worker + workerCount 全部重建</td><td><span class="tag tag-ok">✓</span></td></tr>
+            <tr><td>7</td><td>Redis Key TTL兜底</td><td>pj:cl:inst:*:worker 带 SET EX TTL，崩溃后自动过期</td><td><span class="tag tag-ok">✓</span></td></tr>
+            <tr><td>8</td><td>QUEUE回调语义</td><td>回调仅在 REJECT/超时降级时发送，QUEUE排队不发回调</td><td><span class="tag tag-ok">✓</span></td></tr>
+            <tr><td>9</td><td>QUEUE超时降级</td><td>maxQueueWaitMs + isQueueTimeout → 降级为REJECT</td><td><span class="tag tag-ok">✓</span></td></tr>
+            <tr><td>10</td><td>Fail-Open降级</td><td>Redis故障时放行而非阻断，避免级联故障</td><td><span class="tag tag-ok">✓</span></td></tr>
+            <tr><td>11</td><td>零侵入可选</td><td>@Autowired(required=false) + @ConditionalOnProperty</td><td><span class="tag tag-ok">✓</span></td></tr>
+            <tr><td>12</td><td>release幂等安全</td><td>Local: remove返回false不减 / Redis: SREM==0不DECR</td><td><span class="tag tag-ok">✓</span></td></tr>
+        </tbody>
+    </table>
+    </div>
+</div>
+
+<!-- ========== Section 8: 配置参考 ========== -->
+<div class="section">
+    <h2>八、配置项参考</h2>
+    <div class="table-wrap">
+    <table>
+        <thead>
+            <tr><th>配置项</th><th>默认值</th><th>说明</th></tr>
+        </thead>
+        <tbody>
+            <tr><td>powerjob.server.concurrency.enabled</td><td>false</td><td>是否启用全局并发限制</td></tr>
+            <tr><td>powerjob.server.concurrency.max-global-concurrency</td><td>1000</td><td>全局最大并发任务数</td></tr>
+            <tr><td>powerjob.server.concurrency.max-worker-concurrency</td><td>100</td><td>单 Worker 最大并发任务数（0=不限制）</td></tr>
+            <tr><td>powerjob.server.concurrency.over-limit-policy</td><td>REJECT</td><td>超限策略：REJECT 直接失败 / QUEUE 排队等待</td></tr>
+            <tr><td>powerjob.server.concurrency.max-queue-wait-ms</td><td>60000</td><td>QUEUE 策略最长等待时间（ms），-1 不限制</td></tr>
+            <tr><td>powerjob.server.concurrency.inst-worker-key-ttl-seconds</td><td>86400</td><td>Redis inst:worker 映射 Key TTL（秒）</td></tr>
+            <tr><td>powerjob.server.concurrency.limiter-type</td><td>local</td><td>限制器类型：local / redis</td></tr>
+        </tbody>
+    </table>
+    </div>
+</div>
+
+<div class="footer">
+    PowerJob Server 全局并发控制执行流程图 · 基于 ConcurrencyLimiterService + DispatchService + InstanceManager
+</div>
+
+<script>
+    mermaid.initialize({
+        startOnLoad: true,
+        theme: 'default',
+        flowchart: {
+            useMaxWidth: true,
+            htmlLabels: true,
+            curve: 'basis',
+            padding: 16
+        },
+        securityLevel: 'loose'
+    });
+</script>
+</body>
+</html>
