@@ -266,7 +266,7 @@ common（基础工具）
 1. 通过 `WorkerClusterQueryService` 获取可用 Worker 列表
 2. 通过过滤器链过滤 Worker：
    - `DesignatedWorkerFilter`：仅保留指定 Worker
-   - `DisconnectedWorkerFilter`：排除断开连接的 Worker
+   - `DisconnectedWorkerFilter`：排除开连接的 Worker
    - `SystemMetricsWorkerFilter`：根据 CPU/内存/磁盘过滤
 3. 通过 `TaskTrackerSelectorService` 按策略选择目标 Worker：
    - `RandomTaskTrackerSelector`：随机选择
@@ -547,7 +547,7 @@ PowerScheduleService.scheduleNormalJob()
 ├─► 3. 对每个就绪任务
 │   │
 │   ├─► TimingStrategyService.process()
-│   │       根据时间表达式判断是否需要触发
+│   │       根据时间表达式判是否需要触发
 │   │
 │   ├─► InstanceService.createInstance()
 │   │       生成 instanceId（雪花算法）
@@ -643,9 +643,9 @@ WorkflowInstanceManager.processNodeFinish(wfInstanceId, nodeId, result)
     │
     ├─► 更新 wfContext（存储节点输出）
     │
-    ├─► 判断节点结果
+    ├─► 判节点结果
     │   ├─ DECISION 节点: 求值条件表达式，确定走哪条路径
-    │   ├─ JOB 节点: 直接判断成功/失败
+    │   ├─ JOB 节点: 直接判成功/失败
     │   └─ NESTED_WORKFLOW: 等待子工作流完成
     │
     ├─► 查找可触发的后续节点

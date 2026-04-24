@@ -43,6 +43,17 @@ public class WorkerActor {
     public void onReceiveServerScheduleJobReq(ServerScheduleJobReq req) {
         taskTrackerActor.onReceiveServerScheduleJobReq(req);
     }
+
+    @Handler(path = WTT_HANDLER_PRE_SCHEDULE_JOB)
+    public void onReceiveServerPreScheduleJobReq(ServerPreScheduleJobReq req) {
+        taskTrackerActor.onReceiveServerPreScheduleJobReq(req);
+    }
+
+    @Handler(path = WTT_HANDLER_CANCEL_PRE_LOAD_JOB)
+    public void onReceiveServerCancelPreLoadReq(ServerCancelPreLoadReq req) {
+        taskTrackerActor.onReceiveServerCancelPreLoadReq(req);
+    }
+
     @Handler(path = WTT_HANDLER_STOP_INSTANCE)
     public void onReceiveServerStopInstanceReq(ServerStopInstanceReq req) {
         taskTrackerActor.onReceiveServerStopInstanceReq(req);

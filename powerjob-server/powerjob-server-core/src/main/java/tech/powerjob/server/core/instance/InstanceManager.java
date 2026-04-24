@@ -211,6 +211,13 @@ public class InstanceManager implements TransportServiceAware {
         final int i = instanceInfoRepository.updateStatusChangeInfoByInstanceIdAndStatus(instanceInfo.getLastReportTime(), instanceInfo.getGmtModified(), instanceInfo.getRunningTimes(), instanceInfo.getStatus(), instanceInfo.getInstanceId(), originStatus);
         if (i == 0) {
             log.warn("[InstanceManager-{}] update instance status failed, maybe the instance status has been changed by other thread. discard this status change,{}", instanceId, instanceInfo);
+        } else if (instanceInfo.getStatus() == InstanceStatus.WAITING_DISPATCH.getV()) {
+            // 重试分支：清除预调度记录，避免重试时携带上次调度的 preScheduledWorker 影响 Worker 选择
+            try {
+                instanceInfoRepository.clearPreScheduledWorker(instanceId, new Date(), InstanceStatus.WAITING_DISPATCH.getV());
+            } catch (Exception e) {
+                log.warn("[InstanceManager-{}] failed to clear preScheduledWorker on retry, next dispatch may incorrectly prefer stale pre-scheduled worker.", instanceId, e);
+            }
         }
     }
 

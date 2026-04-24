@@ -68,7 +68,7 @@ public class InstanceInfoDTO {
     private String taskTrackerAddress;
 
     /**
-     * 总共执行的次数（用于重试判断）
+     * 总共执行的次数（用于重试判）
      */
     private Long runningTimes;
 

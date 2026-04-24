@@ -12,6 +12,7 @@ import tech.powerjob.common.enums.InstanceStatus;
 import tech.powerjob.common.enums.TimeExpressionType;
 import tech.powerjob.common.model.LifeCycle;
 import tech.powerjob.common.enums.SwitchableStatus;
+import tech.powerjob.server.common.constants.DispatchProperties;
 import tech.powerjob.server.common.timewheel.holder.InstanceTimeWheelService;
 import tech.powerjob.server.core.DispatchService;
 import tech.powerjob.server.core.instance.InstanceService;
@@ -27,6 +28,7 @@ import tech.powerjob.server.remote.transporter.TransportService;
 import tech.powerjob.server.remote.worker.WorkerClusterManagerService;
 
 import java.util.*;
+import java.util.concurrent.TimeUnit;
 
 /**
  * 任务调度执行服务（调度 CRON 表达式的任务进行执行）
@@ -65,7 +67,19 @@ public class PowerScheduleService {
 
     private final TimingStrategyService timingStrategyService;
 
+    private final DispatchProperties dispatchProperties;
+
     public static final long SCHEDULE_RATE = 15000;
+
+    /**
+     * 预调度提前量（毫秒）：在正式触发前 30s 发送预热通知给 Worker
+     */
+    private static final long PRE_DISPATCH_LEAD_MS = 30_000;
+
+    /**
+     * preDispatch 在 InstanceTimeWheelService 中的 uniqueId 偏移量，确保与 dispatch 不冲突
+     */
+    private static final long PRE_DISPATCH_FLAG = 100_000_000_000L;
 
 
     public void scheduleNormalJob(TimeExpressionType timeExpressionType) {
@@ -144,8 +158,9 @@ public class PowerScheduleService {
 
     /**
      * 调度普通服务端计算表达式类型（CRON、DAILY_TIME_INTERVAL）的任务
+     *
      * @param timeExpressionType 表达式类型
-     * @param appIds appIds
+     * @param appIds             appIds
      */
     private void scheduleNormalJob0(TimeExpressionType timeExpressionType, List<Long> appIds) {
 
@@ -184,8 +199,13 @@ public class PowerScheduleService {
                     } else {
                         delay = targetTriggerTime - nowTime;
                     }
-
                     InstanceTimeWheelService.schedule(instanceId, delay, () -> dispatchService.dispatch(jobInfoDO, instanceId, Optional.empty(), Optional.empty()));
+                    // 预调度开关开启时，在 dispatch 前约 30s 发送预热通知给 Worker（preLoad 钩子）
+                    // 主要收益场景：EXTERNAL 动态加载 Processor；静态 Processor 建议保持关闭
+                    if (delay > 0 && dispatchProperties.isPreDispatchEnabled()) {
+                        long preDispatchDelay = Math.max(1, delay - PRE_DISPATCH_LEAD_MS);
+                        InstanceTimeWheelService.schedule(instanceId + PRE_DISPATCH_FLAG, preDispatchDelay, () -> dispatchService.preDispatch(jobInfoDO, instanceId));
+                    }
                 });
 
                 // 3. 计算下一次调度时间（忽略5S内的重复执行，即CRON模式下最小的连续执行间隔为 SCHEDULE_RATE ms）

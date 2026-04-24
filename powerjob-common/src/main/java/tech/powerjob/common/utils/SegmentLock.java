@@ -27,9 +27,9 @@ public class SegmentLock {
     }
 
     /**
-     * 阻塞获取锁，可被打断
+     * 阻塞获取锁，可被打
      * @param lockId 锁ID
-     * @throws InterruptedException 线程被中断异常
+     * @throws InterruptedException 线程被中异常
      */
     public void lockInterruptible(int lockId) throws InterruptedException {
         Lock lock = locks[lockId & mask];

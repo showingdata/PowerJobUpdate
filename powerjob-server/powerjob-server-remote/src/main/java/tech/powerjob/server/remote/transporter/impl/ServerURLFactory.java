@@ -19,6 +19,14 @@ public class ServerURLFactory {
         return simileBuild(address, ServerType.WORKER, WORKER_PATH, WTT_HANDLER_RUN_JOB);
     }
 
+    public static URL preScheduleJob2Worker(String address) {
+        return simileBuild(address, ServerType.WORKER, WORKER_PATH, WTT_HANDLER_PRE_SCHEDULE_JOB);
+    }
+
+    public static URL cancelPreLoadJob2Worker(String address) {
+        return simileBuild(address, ServerType.WORKER, WORKER_PATH, WTT_HANDLER_CANCEL_PRE_LOAD_JOB);
+    }
+
     public static URL stopInstance2Worker(String address) {
         return simileBuild(address, ServerType.WORKER, WORKER_PATH, WTT_HANDLER_STOP_INSTANCE);
     }

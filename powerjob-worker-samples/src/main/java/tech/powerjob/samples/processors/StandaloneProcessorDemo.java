@@ -1,6 +1,7 @@
 package tech.powerjob.samples.processors;
 
 import org.apache.commons.lang3.StringUtils;
+import tech.powerjob.worker.core.processor.PreLoadContext;
 import tech.powerjob.worker.core.processor.ProcessResult;
 import tech.powerjob.worker.core.processor.TaskContext;
 import tech.powerjob.worker.core.processor.sdk.BasicProcessor;
@@ -32,7 +33,7 @@ public class StandaloneProcessorDemo implements BasicProcessor {
         } catch (Exception e) {
             omsLogger.error("oh~it seems that we have an exception~", e);
         }
-        log.info("================ StandaloneProcessorDemo#process ================");
+        System.out.println("================ StandaloneProcessorDemo#process ================");
         log.info("jobParam:{}", context.getJobParams());
         log.info("instanceParams:{}", context.getInstanceParams());
         String param;
@@ -47,5 +48,15 @@ public class StandaloneProcessorDemo implements BasicProcessor {
         omsLogger.info("StandaloneProcessorDemo finished process,success: {}", success);
         omsLogger.info("anyway, we finished the job successfully~Congratulations!");
         return new ProcessResult(success, context + ": " + success);
+    }
+
+    @Override
+    public void preLoad(PreLoadContext context) throws Exception {
+        System.out.println(" @@@@@@@ 触发预加载~~~~~~~~~");
+    }
+
+    @Override
+    public void preLoadCancel(PreLoadContext context) throws Exception {
+        System.out.println("@@@@@@@ 取消发预加载~~~~~~~~~" + context);
     }
 }

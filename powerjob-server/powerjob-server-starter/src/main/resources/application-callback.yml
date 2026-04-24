@@ -1,22 +1,29 @@
 # PowerJob 并发限制和回调通知配置示例
 powerjob:
   server:
+    # 任务派发配置
+    dispatch:
+      # 是否启用预调度（preDispatch）功能（默认false）
+      # 主要收益场景：EXTERNAL 类型 Processor 动态类加载（消除冷启动延迟）
+      # 静态 Spring Bean Processor 的 preLoad 默认为空方法，开启无收益，建议保持关闭
+      pre-dispatch-enabled: false
     # 全局并发限制配置
     concurrency:
       # 是否启用全局并发限制（默认false）
       enabled: true
       # 全局最大并发任务数（默认1000）
-      max-global-concurrency: 3
-      # 单 Worker 最大并发任务数（默认100） 单 Server + Local 模式下建议修改成 0
-      # tryAcquireWorker 确实和已有机制高度重叠，实际价值有限，filterOverloadWorker + Worker 自拒绝已经够用了
-      # 多 Server + Redis 模式下
-      # Server A 和 Server B 同时往 Worker X 派发，Worker 心跳只有 10 秒一次，两个 Server 看到的 overload 状态可能都是 false，
-      # 但实际上两者加起来已经超过 Worker 的承载上限。Redis 计数器让两个 Server 共享同一个 Worker 的派发计数，能精确拦截。
+      max-global-concurrency: 1000
+      # 单 Worker 最大并发任务数（0 = 不限制，推荐）
+      # Worker 侧已有两道防线：filterOverloadWorker（CPU/内存心跳过滤）+ TaskTracker 数量硬上限（超出自拒绝）
+      # 通常无需 Server 侧再叠加计数限制；仅在多 Server + Redis 模式下需要精确防止双重派发时才考虑开启
       max-worker-concurrency: 0
       # 超限策略: REJECT(直接拒绝)  QUEUE(排队等待)
       over-limit-policy: REJECT
-      # 排队超时时间(秒)，仅 QUEUE 模式有效
-      queue-timeout-seconds: 60
+      # 排队超时时间(毫秒)，仅 QUEUE 模式有效；-1 表示不限制（慎用）
+      max-queue-wait-ms: 60000
+      # 每个 JOB 最多允许积压的实例数（WAITING_DISPATCH 状态），-1 表示不限制（慎用）
+      # 防止 max-queue-wait-ms=-1 时并发持续饱和导致实例无限堆积（OOM / DB 爆炸）
+      max-queue-depth: 1000
       # 限制器类型: local(本地内存) redis(分布式)
       limiter-type: local
     # 回调通知配置

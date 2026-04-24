@@ -173,7 +173,7 @@ public class PowerJobLoginServiceImpl implements PowerJobLoginService {
 
         BeanUtils.copyProperties(dbUser, powerJobUser);
 
-        // 兼容某些直接通过 ifLogin 判断登录的场景
+        // 兼容某些直接通过 ifLogin 判登录的场景
         LoginUserHolder.set(powerJobUser);
 
         return Optional.of(powerJobUser);

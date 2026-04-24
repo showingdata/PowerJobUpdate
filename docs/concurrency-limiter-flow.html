@@ -375,7 +375,7 @@ flowchart TD
             <tr><td>7</td><td>Redis Key TTL兜底</td><td>pj:cl:inst:*:worker 带 SET EX TTL，崩溃后自动过期</td><td><span class="tag tag-ok">✓</span></td></tr>
             <tr><td>8</td><td>QUEUE回调语义</td><td>回调仅在 REJECT/超时降级时发送，QUEUE排队不发回调</td><td><span class="tag tag-ok">✓</span></td></tr>
             <tr><td>9</td><td>QUEUE超时降级</td><td>maxQueueWaitMs + isQueueTimeout → 降级为REJECT</td><td><span class="tag tag-ok">✓</span></td></tr>
-            <tr><td>10</td><td>Fail-Open降级</td><td>Redis故障时放行而非阻断，避免级联故障</td><td><span class="tag tag-ok">✓</span></td></tr>
+            <tr><td>10</td><td>Fail-Open降级</td><td>Redis故障时放行而非阻，避免级联故障</td><td><span class="tag tag-ok">✓</span></td></tr>
             <tr><td>11</td><td>零侵入可选</td><td>@Autowired(required=false) + @ConditionalOnProperty</td><td><span class="tag tag-ok">✓</span></td></tr>
             <tr><td>12</td><td>release幂等安全</td><td>Local: remove返回false不减 / Redis: SREM==0不DECR</td><td><span class="tag tag-ok">✓</span></td></tr>
         </tbody>

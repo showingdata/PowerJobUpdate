@@ -65,7 +65,7 @@ public abstract class PropertyAndOneBeanCondition implements Condition {
             return true;
         }
 
-        // 判断前缀是否符合，任意满足即可
+        // 判前缀是否符合，任意满足即可
         for (String key : keys) {
             if (StringUtils.isNotEmpty(environment.getProperty(key))) {
                 return true;

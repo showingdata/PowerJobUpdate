@@ -10,7 +10,9 @@ import tech.powerjob.server.common.constants.ConcurrencyProperties;
 import tech.powerjob.server.extension.ConcurrencyLimiterService;
 
 import org.springframework.data.redis.core.Cursor;
+import org.springframework.data.redis.core.RedisOperations;
 import org.springframework.data.redis.core.ScanOptions;
+import org.springframework.data.redis.core.SessionCallback;
 
 import java.util.Arrays;
 import java.util.Collections;
@@ -224,37 +226,58 @@ public class RedisConcurrencyLimiterService implements ConcurrencyLimiterService
     private void doRecover(Map<Long, String> runningInstanceWorkerMap) {
         try {
             int validCount = runningInstanceWorkerMap == null ? 0 : runningInstanceWorkerMap.size();
-            // 1. 完整重建 KEY_GLOBAL_PERMITS：先删后写，避免增量修补导致遗漏
-            redisTemplate.delete(KEY_GLOBAL_PERMITS);
-            if (validCount > 0) {
-                String[] validIdArr = runningInstanceWorkerMap.keySet().stream().map(String::valueOf).toArray(String[]::new);
-                redisTemplate.opsForSet().add(KEY_GLOBAL_PERMITS, validIdArr);
-            }
-            // 2. 重置全局计数为实际运行数
-            redisTemplate.opsForValue().set(KEY_GLOBAL_COUNT, String.valueOf(validCount));
-            // 3. 清空 Worker 计数，按实际运行实例重建；用 SCAN 替代 KEYS 避免阻塞 Redis
-            Set<String> workerCountKeys = new HashSet<>();
-            try (Cursor<String> cursor = redisTemplate.scan(ScanOptions.scanOptions().match("pj:cl:{pjcl}:worker:*:count").count(100).build())) {
+
+            // Phase 1: SCAN 旧 Worker 计数 key（游标读取，必须在 MULTI 外完成）
+            Set<String> oldWorkerCountKeys = new HashSet<>();
+            try (Cursor<String> cursor = redisTemplate.scan(
+                    ScanOptions.scanOptions().match("pj:cl:{pjcl}:worker:*:count").count(100).build())) {
                 while (cursor.hasNext()) {
-                    workerCountKeys.add(cursor.next());
+                    oldWorkerCountKeys.add(cursor.next());
                 }
             }
-            if (!workerCountKeys.isEmpty()) {
-                redisTemplate.delete(workerCountKeys);
-            }
-            // 4. 完整重建 KEY_INST_WORKER 和 Worker 计数
+
+            // Phase 2: 预计算所有写入值（无 Redis I/O，MULTI 前备好数据）
+            String[] validIdArr = validCount > 0
+                    ? runningInstanceWorkerMap.keySet().stream().map(String::valueOf).toArray(String[]::new)
+                    : new String[0];
+            Map<String, Long> workerCountMap = new java.util.HashMap<>();
+            Map<Long, String> instWorkerEntries = new java.util.LinkedHashMap<>();
             if (runningInstanceWorkerMap != null) {
-                Map<String, Long> workerCountMap = new java.util.HashMap<>();
                 runningInstanceWorkerMap.forEach((id, addr) -> {
                     if (StringUtils.isNotEmpty(addr)) {
-                        // 重建 instanceId → workerAddress 映射，release 依赖此 key 查找 worker；保持与 acquire 相同的 TTL
-                        redisTemplate.opsForValue().set(String.format(KEY_INST_WORKER, id), addr,
-                                props.getInstWorkerKeyTtlSeconds(), TimeUnit.SECONDS);
+                        instWorkerEntries.put(id, addr);
                         workerCountMap.merge(addr, 1L, Long::sum);
                     }
                 });
-                workerCountMap.forEach((addr, count) -> redisTemplate.opsForValue().set(String.format(KEY_WORKER_COUNT, addr), String.valueOf(count)));
             }
+            long ttl = props.getInstWorkerKeyTtlSeconds();
+            String globalCountStr = String.valueOf(validCount);
+
+            // Phase 3: 所有写操作在 MULTI/EXEC 中原子执行，消除写操作之间的竞态窗口
+            // SCAN → EXEC 之间仍有极短窗口，但 startup 场景并发压力极低，影响可接受
+            redisTemplate.execute(new SessionCallback<Object>() {
+                @Override
+                public Object execute(RedisOperations operations) {
+                    operations.multi();
+                    // 3a. 重建全局 permits set 和计数
+                    operations.delete(KEY_GLOBAL_PERMITS);
+                    if (validIdArr.length > 0) {
+                        operations.opsForSet().add(KEY_GLOBAL_PERMITS, validIdArr);
+                    }
+                    operations.opsForValue().set(KEY_GLOBAL_COUNT, globalCountStr);
+                    // 3b. 清空旧 Worker 计数（与 3a 同批，不留中间状态）
+                    if (!oldWorkerCountKeys.isEmpty()) {
+                        operations.delete(oldWorkerCountKeys);
+                    }
+                    // 3c. 重建 instanceId → workerAddress 映射
+                    instWorkerEntries.forEach((id, addr) ->
+                            operations.opsForValue().set(String.format(KEY_INST_WORKER, id), addr, ttl, TimeUnit.SECONDS));
+                    // 3d. 重建 Worker 计数
+                    workerCountMap.forEach((addr, count) ->
+                            operations.opsForValue().set(String.format(KEY_WORKER_COUNT, addr), String.valueOf(count)));
+                    return operations.exec();
+                }
+            });
 
             log.info("[RedisConcurrencyLimiter] startup recovery done, globalCount={}", validCount);
         } catch (Exception e) {

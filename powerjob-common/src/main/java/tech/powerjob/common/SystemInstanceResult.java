@@ -27,7 +27,7 @@ public class SystemInstanceResult {
      */
     public static final String INSTANCE_EXECUTE_TIMEOUT = "instance execute timeout";
     /**
-     * 任务执行超时，成功打断任务
+     * 任务执行超时，成功打任务
      */
     public static final String INSTANCE_EXECUTE_TIMEOUT_INTERRUPTED = "instance execute timeout,interrupted success";
     /**
@@ -36,7 +36,7 @@ public class SystemInstanceResult {
     public static final String INSTANCE_EXECUTE_TIMEOUT_FORCE_STOP= "instance execute timeout,force stop success";
 
     /**
-     * 用户手动停止任务，成功打断任务
+     * 用户手动停止任务，成功打任务
      */
     public static final String USER_STOP_INSTANCE_INTERRUPTED= "user stop instance,interrupted success";
     /**

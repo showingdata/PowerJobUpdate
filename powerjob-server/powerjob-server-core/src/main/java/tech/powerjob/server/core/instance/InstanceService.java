@@ -2,6 +2,7 @@ package tech.powerjob.server.core.instance;
 
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.apache.commons.lang3.StringUtils;
 import org.springframework.beans.BeanUtils;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
@@ -115,9 +116,9 @@ public class InstanceService {
      * @param instanceId 任务实例ID
      */
     @DesignateServer
-    public void stopInstance(Long appId,Long instanceId) {
+    public void stopInstance(Long appId, Long instanceId) {
 
-        log.info("[Instance-{}] try to stop the instance instance in appId: {}", instanceId,appId);
+        log.info("[Instance-{}] try to stop the instance instance in appId: {}", instanceId, appId);
         try {
 
             InstanceInfoDO instanceInfo = fetchInstanceInfo(instanceId);
@@ -126,7 +127,12 @@ public class InstanceService {
                 throw new IllegalArgumentException("can't stop finished instance!");
             }
 
-            // 更新数据库，将状态置为停止
+            // 提前保存 preScheduledWorker 地址，随后在同一次 saveAndFlush 中原子清零，
+            // 确保 DB 写入 STOPPED 状态时 preScheduledWorker 同步为 null，
+            // 消除 dispatch 时间轮在两次写之间读到 stale 地址造成 cancelPreLoad 重复发送的竞争窗口
+            String savedPreScheduledWorker = instanceInfo.getPreScheduledWorker();
+            instanceInfo.setPreScheduledWorker(null);
+            instanceInfo.setPreScheduleTime(null);
             instanceInfo.setStatus(STOPPED.getV());
             instanceInfo.setGmtModified(new Date());
             instanceInfo.setFinishedTime(System.currentTimeMillis());
@@ -134,6 +140,13 @@ public class InstanceService {
             instanceInfoRepository.saveAndFlush(instanceInfo);
 
             instanceManager.processFinishedInstance(instanceId, instanceInfo.getWfInstanceId(), STOPPED, SystemInstanceResult.STOPPED_BY_USER);
+
+            // DB 已在 saveAndFlush 中清零，此处用保存的地址直接发通知，Fix 2 时间轮触发时读到 null 为 no-op
+            if (StringUtils.isNotEmpty(savedPreScheduledWorker)) {
+                final String workerToCancel = savedPreScheduledWorker;
+                jobInfoRepository.findById(instanceInfo.getJobId())
+                        .ifPresent(jobInfo -> dispatchService.cancelPreLoadByAddress(jobInfo, instanceInfo, workerToCancel));
+            }
 
             /*
             不可靠通知停止 TaskTracker
@@ -182,12 +195,14 @@ public class InstanceService {
         instanceInfo.setActualTriggerTime(null);
         instanceInfo.setTaskTrackerAddress(null);
         instanceInfo.setResult(null);
+        instanceInfo.setPreScheduledWorker(null);
+        instanceInfo.setPreScheduleTime(null);
         instanceInfoRepository.saveAndFlush(instanceInfo);
 
         // 派发任务
         Long jobId = instanceInfo.getJobId();
         JobInfoDO jobInfo = jobInfoRepository.findById(jobId).orElseThrow(() -> new PowerJobException("can't find job info by jobId: " + jobId));
-        dispatchService.dispatch(jobInfo, instanceId,Optional.of(instanceInfo),Optional.empty());
+        dispatchService.dispatch(jobInfo, instanceId, Optional.of(instanceInfo), Optional.empty());
     }
 
     /**
@@ -216,16 +231,32 @@ public class InstanceService {
             }
 
             if (success) {
+                // 与 stopInstance 保持相同的原子策略：先保存地址，在同一次 saveAndFlush 中清零，
+                // 消除 dispatch 时间轮在写入 CANCELED 与清零 preScheduledWorker 之间读到 stale 地址、
+                // 与后续 cancelPreLoad 重复发送的竞争窗口
+                String savedPreScheduledWorker = instanceInfo.getPreScheduledWorker();
+                instanceInfo.setPreScheduledWorker(null);
+                instanceInfo.setPreScheduleTime(null);
                 instanceInfo.setStatus(InstanceStatus.CANCELED.getV());
                 instanceInfo.setResult(SystemInstanceResult.CANCELED_BY_USER);
                 // 如果写 DB 失败，抛异常，接口返回 false，即取消失败，任务会被 HA 机制重新调度执行，因此此处不需要任何处理
                 instanceInfoRepository.saveAndFlush(instanceInfo);
+                // DB 已在 saveAndFlush 中清零，dispatch 时间轮触发时读到 null 为 no-op；
+                // 此处用保存的地址发一次通知，确保 Worker 释放 preLoad 资源（best-effort）
+                if (StringUtils.isNotEmpty(savedPreScheduledWorker)) {
+                    try {
+                        final String workerToCancel = savedPreScheduledWorker;
+                        jobInfoRepository.findById(instanceInfo.getJobId())
+                                .ifPresent(jobInfo -> dispatchService.cancelPreLoadByAddress(jobInfo, instanceInfo, workerToCancel));
+                    } catch (Exception ex) {
+                        log.warn("[Instance-{}] failed to send cancelPreLoad after cancel, preLoad resources on worker[{}] may not be released.", instanceId, savedPreScheduledWorker, ex);
+                    }
+                }
                 log.info("[Instance-{}] cancel the instance successfully.", instanceId);
             } else {
                 log.warn("[Instance-{}] cancel the instance failed.", instanceId);
                 throw new PowerJobException("instance already up and running");
             }
-
         } catch (Exception e) {
             log.error("[Instance-{}] cancelInstance failed.", instanceId, e);
             throw e;
@@ -273,7 +304,7 @@ public class InstanceService {
     /**
      * 获取任务实例的详细运行详细
      *
-     * @param appId 用于远程 server 路由，勿删！
+     * @param appId      用于远程 server 路由，勿删！
      * @param instanceId 任务实例ID
      * @return 详细运行状态
      */
@@ -307,7 +338,7 @@ public class InstanceService {
                     instanceDetail.setRunningTimes(instanceInfoDO.getRunningTimes());
                     instanceDetail.setInstanceParams(instanceInfoDO.getInstanceParams());
                     return instanceDetail;
-                }else {
+                } else {
                     log.warn("[Instance-{}] ask InstanceStatus from TaskTracker failed, the message is {}.", instanceId, askResponse.getMessage());
                 }
             } catch (Exception e) {

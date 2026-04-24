@@ -17,7 +17,7 @@ public enum WorkflowNodeType {
      */
     JOB(1,false),
     /**
-     * 判断节点
+     * 判节点
      */
     DECISION(2,true),
     /**

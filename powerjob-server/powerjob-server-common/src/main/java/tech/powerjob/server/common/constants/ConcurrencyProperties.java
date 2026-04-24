@@ -23,9 +23,11 @@ public class ConcurrencyProperties {
     private int maxGlobalConcurrency = 1000;
 
     /**
-     * 单 Worker 最大并发任务数（0=不限制）
+     * 单 Worker 最大并发任务数（0=不限制，推荐）
+     * Worker 侧已有 filterOverloadWorker + TaskTracker 数量硬上限两道防线，通常无需 Server 侧叠加限制。
+     * 仅多 Server + Redis 模式下需要精确防止双重派发时才考虑配置具体数值。
      */
-    private int maxWorkerConcurrency = 100;
+    private int maxWorkerConcurrency = 0;
 
     /**
      * 超限策略：REJECT / QUEUE
@@ -34,9 +36,16 @@ public class ConcurrencyProperties {
 
     /**
      * QUEUE 策略下实例最长等待时间（毫秒），60s 1分钟 超时后降级为 REJECT。
-     * <=0 如-1  表示不限制（慎用：并发持续饱和时实例将无限积压）。
+     * <=0 如-1  表示不限制（慎用：和 maxQueueDepth=-1 同时使用时，并发持续饱和的实例可无限堆积）。
      */
     private long maxQueueWaitMs = 60_000;
+
+    /**
+     * QUEUE 策略下每个 JOB 最多允许积压的实例数（WAITING_DISPATCH 状态）。
+     * 超限时立刻降级为 REJECT，防止 maxQueueWaitMs=-1 时实例无限堆积（OOM / DB 爆炸）。
+     * -1 表示不限制（慎用）。
+     */
+    private int maxQueueDepth = 1000;
 
     /**
      * Redis 实现中 pj:cl:inst:{id}:worker 的 TTL（秒）。 等于1天（24小时）

@@ -208,9 +208,9 @@ public class NetUtils {
     }
 
     /**
-     * 通过用户方法判断是否为目标网卡
+     * 通过用户方法判是否为目标网卡
      * @param networkInterface networkInterface
-     * @param networkInterfaceChecker 判断方法
+     * @param networkInterfaceChecker 判方法
      * @return true or false
      */
     static boolean isPassedCheckNetworkInterface(NetworkInterface networkInterface, NetworkInterfaceChecker networkInterfaceChecker) {

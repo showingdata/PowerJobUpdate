@@ -57,7 +57,7 @@ public class PowerJobPermissionServiceImpl implements PowerJobPermissionService 
             }
         }
 
-        // 前置判断需要的权限（新增场景还没有 appId or namespaceId）
+        // 前置判需要的权限（新增场景还没有 appId or namespaceId）
         if (requiredPermission == Permission.NONE) {
             return true;
         }

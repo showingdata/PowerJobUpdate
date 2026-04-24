@@ -61,7 +61,7 @@ public interface InstanceInfoRepository extends JpaRepository<InstanceInfoDO, Lo
     @Transactional(rollbackOn = Exception.class)
     @Modifying
     @CanIgnoreReturnValue
-    @Query(value = "update InstanceInfoDO set status = :status, actualTriggerTime = :actualTriggerTime, finishedTime = :finishedTime, taskTrackerAddress = :taskTrackerAddress, result = :result,  gmtModified = :modifyTime where instanceId = :instanceId")
+    @Query(value = "update InstanceInfoDO set status = :status, actualTriggerTime = :actualTriggerTime, finishedTime = :finishedTime, taskTrackerAddress = :taskTrackerAddress, result = :result, preScheduledWorker = null, preScheduleTime = null, gmtModified = :modifyTime where instanceId = :instanceId")
     int update4TriggerFailed(@Param("instanceId") long instanceId, @Param("status") int status, @Param("actualTriggerTime") long actualTriggerTime, @Param("finishedTime") long finishedTime, @Param("taskTrackerAddress") String taskTrackerAddress, @Param("result") String result, @Param("modifyTime") Date modifyTime);
 
 
@@ -79,21 +79,21 @@ public interface InstanceInfoRepository extends JpaRepository<InstanceInfoDO, Lo
     @Transactional(rollbackOn = Exception.class)
     @Modifying
     @CanIgnoreReturnValue
-    @Query(value = "update InstanceInfoDO set status = :status,  actualTriggerTime = :actualTriggerTime, taskTrackerAddress = :taskTrackerAddress, gmtModified = :modifyTime where instanceId = :instanceId and status = :oldStatus")
+    @Query(value = "update InstanceInfoDO set status = :status, actualTriggerTime = :actualTriggerTime, taskTrackerAddress = :taskTrackerAddress, preScheduledWorker = null, preScheduleTime = null, gmtModified = :modifyTime where instanceId = :instanceId and status = :oldStatus")
     int update4TriggerSucceed(@Param("instanceId") long instanceId, @Param("status") int status, @Param("actualTriggerTime") long actualTriggerTime, @Param("taskTrackerAddress") String taskTrackerAddress, @Param("modifyTime") Date modifyTime, @Param("oldStatus") int oldStatus);
 
 
     @Transactional(rollbackOn = Exception.class)
     @Modifying
     @CanIgnoreReturnValue
-    @Query(value = "update InstanceInfoDO set status = :status, gmtModified = :modifyTime where instanceId = :instanceId and status = :originStatus ")
+    @Query(value = "update InstanceInfoDO set status = :status, preScheduledWorker = null, preScheduleTime = null, gmtModified = :modifyTime where instanceId = :instanceId and status = :originStatus ")
     int updateStatusAndGmtModifiedByInstanceIdAndOriginStatus(@Param("instanceId") long instanceId, @Param("originStatus") int originStatus, @Param("status") int status, @Param("modifyTime") Date modifyTime);
 
 
     @Transactional(rollbackOn = Exception.class)
     @Modifying
     @CanIgnoreReturnValue
-    @Query(value = "update InstanceInfoDO set status = :status, gmtModified = :modifyTime where instanceId in (:instanceIdList) and status = :originStatus ")
+    @Query(value = "update InstanceInfoDO set status = :status, preScheduledWorker = null, preScheduleTime = null, gmtModified = :modifyTime where instanceId in (:instanceIdList) and status = :originStatus ")
     int updateStatusAndGmtModifiedByInstanceIdListAndOriginStatus(@Param("instanceIdList") List<Long> instanceIdList, @Param("originStatus") int originStatus, @Param("status") int status, @Param("modifyTime") Date modifyTime);
 
     /**
@@ -121,6 +121,24 @@ public interface InstanceInfoRepository extends JpaRepository<InstanceInfoDO, Lo
 
 
     InstanceInfoDO findByInstanceId(long instanceId);
+
+    /**
+     * 更新预调度信息（记录预选 Worker，供正式派发时优先使用）
+     */
+    @Transactional(rollbackOn = Exception.class)
+    @Modifying
+    @CanIgnoreReturnValue
+    @Query(value = "update InstanceInfoDO set preScheduledWorker = :preScheduledWorker, preScheduleTime = :preScheduleTime, gmtModified = :modifyTime where instanceId = :instanceId and status = :status")
+    int update4PreSchedule(@Param("instanceId") long instanceId, @Param("preScheduledWorker") String preScheduledWorker, @Param("preScheduleTime") long preScheduleTime, @Param("modifyTime") Date modifyTime, @Param("status") int status);
+
+    /**
+     * 清除预调度信息（并发满载被拒时调用，避免 QUEUE 重试循环选中同一满载 Worker）
+     */
+    @Transactional(rollbackOn = Exception.class)
+    @Modifying
+    @CanIgnoreReturnValue
+    @Query(value = "update InstanceInfoDO set preScheduledWorker = null, preScheduleTime = null, gmtModified = :modifyTime where instanceId = :instanceId and status = :status")
+    int clearPreScheduledWorker(@Param("instanceId") long instanceId, @Param("modifyTime") Date modifyTime, @Param("status") int status);
 
     List<InstanceInfoDO> findByStatusIn(List<Integer> statuses);
 

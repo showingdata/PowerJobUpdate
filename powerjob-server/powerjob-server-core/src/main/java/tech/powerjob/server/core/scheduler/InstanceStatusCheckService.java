@@ -176,6 +176,9 @@ public class InstanceStatusCheckService {
                     Optional<JobInfoDO> jobInfoOpt = Optional.ofNullable(jobInfoMap.get(instance.getJobId()));
                     if (jobInfoOpt.isPresent()) {
                         // 处理等待派发的任务没有必要再重置一次状态，减少 io 次数
+                        // 保留 preScheduledWorker 字段，交由 dispatch → selectTaskTracker 统一处理：
+                        // 若预选 Worker 仍可用则复用（该 Worker 已完成 preLoad，最优）；
+                        // 若已不可用则由 selectTaskTracker 发送 cancelPreLoad 后降级，避免 HA 恢复时 preLoad 资源泄漏
                         dispatchService.dispatch(jobInfoOpt.get(), instance.getInstanceId(), Optional.of(instance), Optional.of(overloadFlag));
                     } else {
                         log.warn("[InstanceStatusChecker] can't find job by jobId[{}], so redispatch failed, failed instance: {}", instance.getJobId(), instance);
@@ -291,6 +294,11 @@ public class InstanceStatusCheckService {
 
         log.warn("[InstanceStatusChecker] instance[{}] failed due to {}, instanceInfo: {}", instance.getInstanceId(), result, instance);
 
+        // 与 stopInstance 保持相同的原子策略：先保存地址，在同一次 saveAndFlush 中清零，
+        // 避免 dispatch 时间轮在写入 FAILED 与清零 preScheduledWorker 之间的窗口内读到 stale 地址
+        String savedPreScheduledWorker = instance.getPreScheduledWorker();
+        instance.setPreScheduledWorker(null);
+        instance.setPreScheduleTime(null);
         instance.setStatus(InstanceStatus.FAILED.getV());
         instance.setFinishedTime(System.currentTimeMillis());
         instance.setGmtModified(new Date());
@@ -298,5 +306,12 @@ public class InstanceStatusCheckService {
         instanceInfoRepository.saveAndFlush(instance);
 
         instanceManager.processFinishedInstance(instance.getInstanceId(), instance.getWfInstanceId(), InstanceStatus.FAILED, result);
+
+        // WAITING_DISPATCH 超时被判定为失败时，preDispatch 可能已通知 Worker 完成 preLoad，
+        // 若不主动取消，Worker 侧资源将永远无法释放（best-effort：失败只记日志）
+        if (savedPreScheduledWorker != null && !savedPreScheduledWorker.isEmpty()) {
+            jobInfoRepository.findById(instance.getJobId())
+                    .ifPresent(jobInfo -> dispatchService.cancelPreLoadByAddress(jobInfo, instance, savedPreScheduledWorker));
+        }
     }
 }

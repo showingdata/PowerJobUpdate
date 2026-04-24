@@ -102,7 +102,7 @@ public class CallbackService {
     }
 
     /**
-     * 判断端点是否订阅了该事件
+     * 判端点是否订阅了该事件
      */
     private boolean subscribes(CallbackEndpointDO endpoint, String eventCode) {
         if (StringUtils.isBlank(endpoint.getEventTypes())) {

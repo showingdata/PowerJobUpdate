@@ -68,6 +68,16 @@ public class RemoteConstant {
     public static final String WTT_HANDLER_STOP_INSTANCE = "stopInstance";
 
     /**
+     * server 预调度通知命令（触发前提前通知 Worker 预热处理器）
+     */
+    public static final String WTT_HANDLER_PRE_SCHEDULE_JOB = "preScheduleJob";
+
+    /**
+     * server 取消预调度命令（任务换派到其他 Worker 时通知原 Worker 释放预热资源）
+     */
+    public static final String WTT_HANDLER_CANCEL_PRE_LOAD_JOB = "cancelPreLoadJob";
+
+    /**
      * sever 查询任务状态
      */
     public static final String WTT_HANDLER_QUERY_INSTANCE_STATUS = "queryInstanceStatus";

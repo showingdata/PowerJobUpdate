@@ -131,7 +131,7 @@ public class InstanceLogService {
     public StringPage fetchInstanceLog(Long appId, Long instanceId, Long index) {
         try {
             Future<File> fileFuture = prepareLogFile(instanceId);
-            // 超时并不会打断正在执行的任务
+            // 超时并不会打正在执行的任务
             File logFile = fileFuture.get(5, TimeUnit.SECONDS);
 
             // 分页展示数据
@@ -196,7 +196,7 @@ public class InstanceLogService {
      */
     private Future<File> prepareLogFile(long instanceId) {
         return powerJobBackgroundPool.submit(() -> {
-            // 在线日志还在不断更新，需要使用本地数据库中的数据
+            // 在线日志还在不更新，需要使用本地数据库中的数据
             if (instanceId2LastReportTime.containsKey(instanceId)) {
                 return genTemporaryLogFile(instanceId);
             }

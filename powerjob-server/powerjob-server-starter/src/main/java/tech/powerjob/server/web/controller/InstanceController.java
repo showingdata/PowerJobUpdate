@@ -192,7 +192,7 @@ public class InstanceController {
     }
 
     private void preCheck(Long instanceId, HttpServletRequest hsr) {
-        Optional<InstanceInfoDO> instanceInfoOpt = instanceInfoRepository.findById(instanceId);
+        Optional<InstanceInfoDO> instanceInfoOpt = Optional.ofNullable(instanceInfoRepository.findByInstanceId(instanceId));
         if (!instanceInfoOpt.isPresent()) {
             throw new PowerJobException(ErrorCodes.ILLEGAL_ARGS_ERROR, "Can'tFindInstanceInfoById:" + instanceId);
         }

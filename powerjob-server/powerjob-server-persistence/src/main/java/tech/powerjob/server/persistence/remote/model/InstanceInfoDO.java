@@ -99,6 +99,15 @@ public class InstanceInfoDO {
      */
     private Long runningTimes;
 
+    /**
+     * 预调度选定的 Worker 地址（触发前 30s 预通知的 Worker）
+     */
+    private String preScheduledWorker;
+
+    /**
+     * 预调度时间（毫秒时间戳），用于判断预调度是否过期
+     */
+    private Long preScheduleTime;
 
     private Date gmtCreate;
 

@@ -72,7 +72,7 @@ public class WorkerRequestHandlerImpl extends AbWorkerRequestHandler {
 
     @Override
     protected void processWorkerLogReport0(WorkerLogReportReq req, WorkerLogReportEvent event) {
-        // 这个效率应该不会拉垮吧...也就是一些判断 + Map#get 吧...
+        // 这个效率应该不会拉垮吧...也就是一些判 + Map#get 吧...
         instanceLogService.submitLogs(req.getWorkerAddress(), req.getInstanceLogContents());
     }
 }

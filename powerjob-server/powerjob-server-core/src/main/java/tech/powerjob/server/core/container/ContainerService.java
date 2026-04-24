@@ -119,7 +119,7 @@ public class ContainerService {
 
     /**
      * 删除容器（通知 Worker 销毁容器 & 删除数据库）
-     * @param appId 应用ID，用于保护性判断
+     * @param appId 应用ID，用于保护性判
      * @param containerId 容器ID
      */
     public void delete(Long appId, Long containerId) {

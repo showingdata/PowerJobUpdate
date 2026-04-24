@@ -76,7 +76,7 @@ class TestGlobalConcurrencyLimit extends ClientInitializer {
 
         log.info("[TC-E01] running={}, failed={}, limit={}", runningCount, failedCount, GLOBAL_LIMIT);
 
-        // 核心断言
+        // 核心言
         assert runningCount <= GLOBAL_LIMIT : "运行中实例数 " + runningCount + " 不应超过上限 " + GLOBAL_LIMIT;
         assert failedCount >= (triggerCount - GLOBAL_LIMIT) : "超出上限的实例应全部 FAILED";
     }

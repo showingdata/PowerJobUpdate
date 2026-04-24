@@ -60,7 +60,7 @@ public class DingTalkUtils implements Closeable {
     }
 
     /**
-     * 获取 AccessToken，AccessToken 是调用其他接口的基础，有效期 7200 秒，需要不断刷新
+     * 获取 AccessToken，AccessToken 是调用其他接口的基础，有效期 7200 秒，需要不刷新
      * @param appKey 应用 appKey
      * @param appSecret 应用 appSecret
      */

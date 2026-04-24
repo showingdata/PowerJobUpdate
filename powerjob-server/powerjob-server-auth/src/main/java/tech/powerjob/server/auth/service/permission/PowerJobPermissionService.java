@@ -18,7 +18,7 @@ public interface PowerJobPermissionService {
 
 
     /**
-     * 判断用户是否有访问权限
+     * 判用户是否有访问权限
      * @param userId userId
      * @param roleScope 权限范围
      * @param target 权限目标ID

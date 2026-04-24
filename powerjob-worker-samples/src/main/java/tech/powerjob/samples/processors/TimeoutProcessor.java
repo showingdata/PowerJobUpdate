@@ -1,6 +1,7 @@
 package tech.powerjob.samples.processors;
 
 import lombok.extern.slf4j.Slf4j;
+import tech.powerjob.worker.core.processor.PreLoadContext;
 import tech.powerjob.worker.core.processor.ProcessResult;
 import tech.powerjob.worker.core.processor.TaskContext;
 import tech.powerjob.worker.core.processor.sdk.BasicProcessor;
@@ -21,5 +22,15 @@ public class TimeoutProcessor implements BasicProcessor {
         log.info("TaskInstance({}) will sleep {} ms", context.getInstanceId(), sleepTime);
         Thread.sleep(Long.parseLong(context.getJobParams()));
         return new ProcessResult(true, "impossible~~~~QAQ~");
+    }
+
+    @Override
+    public void preLoad(PreLoadContext context) throws Exception {
+        System.out.println(" 测试超时任务（可中断）@@@@@@@ 触发预加载~~~~~~~~~");
+    }
+
+    @Override
+    public void preLoadCancel(PreLoadContext context) throws Exception {
+        System.out.println("测试超时任务（可中断） @@@@@@@ 取消发预加载~~~~~~~~~" + context);
     }
 }

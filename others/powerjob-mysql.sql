@@ -85,6 +85,8 @@ CREATE TABLE `instance_info` (
                                  `task_tracker_address` varchar(255) DEFAULT NULL,
                                  `type` int DEFAULT NULL,
                                  `wf_instance_id` bigint DEFAULT NULL,
+                                 `pre_scheduled_worker` varchar(255) DEFAULT NULL COMMENT '预调度选定的 Worker 地址（触发前 30s 预通知的 Worker）',
+                                 `pre_schedule_time` bigint DEFAULT NULL COMMENT '预调度时间（毫秒时间戳）',
                                  PRIMARY KEY (`id`),
                                  KEY `idx01_instance_info` (`job_id`,`status`),
                                  KEY `idx02_instance_info` (`app_id`,`status`),
