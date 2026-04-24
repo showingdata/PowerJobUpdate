@@ -77,7 +77,12 @@ public class PowerScheduleService {
     private static final long PRE_DISPATCH_LEAD_MS = 30_000;
 
     /**
-     * preDispatch 在 InstanceTimeWheelService 中的 uniqueId 偏移量，确保与 dispatch 不冲突
+     * preDispatch 在 InstanceTimeWheelService 中的 uniqueId 偏移量，确保与 dispatch 不冲突。
+     * PowerJob Snowflake 结构：ID = (timestamp << 22) | (dc << 20) | (machine << 6) | sequence
+     * 同一 server 两个 ID 的差值 = δt * 2^22 + δseq，其中 δseq ∈ [-63, 63]。
+     * 10^11 mod 2^22 = 765_136，不在 δseq 合法范围内，故同 server 任意两个 instanceId
+     * 的差值永远不等于此值，instanceId + PRE_DISPATCH_FLAG 不会与任何真实 instanceId 碰撞。
+     * 若调整此值，需保证新值 mod 2^22 不在 [-63, 63] 内（如 2^22 的整数倍会碰撞，禁止使用）。
      */
     private static final long PRE_DISPATCH_FLAG = 100_000_000_000L;
 
