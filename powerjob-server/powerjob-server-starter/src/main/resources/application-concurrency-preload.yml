@@ -1,4 +1,4 @@
-# PowerJob 并发限制和回调通知配置示例
+# PowerJob 并发限制预-回调通知配置示例和预备加载开启功能设置
 powerjob:
   server:
     # 任务派发配置
@@ -11,7 +11,9 @@ powerjob:
     concurrency:
       # 是否启用全局并发限制（默认false）
       enabled: true
-      # 全局最大并发任务数（默认1000）
+      # 全局最大并发任务数（默认1000） 如果是namespace级别即(appid)级别的设置 目前动态设置调整 的方式执行 后续考虑页面方式
+      # app_info max_concurrency字段设置 update app_info set max_concurrency = 50 where app_id = 1
+      # namespace级别即(appid)级别的设置  最大并发任务数 不能超过 全局最大并发任务数
       max-global-concurrency: 1000
       # 单 Worker 最大并发任务数（0 = 不限制，推荐）
       # Worker 侧已有两道防线：filterOverloadWorker（CPU/内存心跳过滤）+ TaskTracker 数量硬上限（超出自拒绝）

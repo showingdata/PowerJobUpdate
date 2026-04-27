@@ -14,9 +14,14 @@ import lombok.Getter;
 public enum OverLimitReason {
 
     /**
-     * 全局并发限制超限
+     * 全局并发限制超限（Server 级别）
      */
     GLOBAL_LIMIT_EXCEEDED("GLOBAL_LIMIT_EXCEEDED", "全局并发限制超限"),
+
+    /**
+     * App 级别并发限制超限
+     */
+    APP_LIMIT_EXCEEDED("APP_LIMIT_EXCEEDED", "App并发限制超限"),
 
     /**
      * Worker 级别并发限制超限

@@ -13,22 +13,28 @@ import org.springframework.data.redis.core.StringRedisTemplate;
 import tech.powerjob.common.enums.InstanceStatus;
 import tech.powerjob.server.common.constants.ConcurrencyProperties;
 import tech.powerjob.server.extension.ConcurrencyLimiterService;
+import tech.powerjob.server.persistence.remote.model.AppInfoDO;
 import tech.powerjob.server.persistence.remote.model.InstanceInfoDO;
+import tech.powerjob.server.persistence.remote.repository.AppInfoRepository;
 import tech.powerjob.server.persistence.remote.repository.InstanceInfoRepository;
 
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Collectors;
 
 
 /**
+ * @author chenjiang
+ * <p>
  * 并发限制器装配配置
  * <p>
  * 当 powerjob.server.concurrency.enabled=true 时，根据 limiter-type 选择实现：
- * - local（默认）：LocalConcurrencyLimiterService，单节点内存计数
- * - redis：RedisConcurrencyLimiterService，分布式计数（需引入 spring-data-redis）
+ * - local（默认）：LocalConcurrencyLimiterService，单节点内存计数 再单server模式下具备良好性能
+ * - redis：RedisConcurrencyLimiterService，分布式计数（需引入 spring-data-redis） 即多server集群模式
  */
 @Slf4j
 @Configuration
@@ -63,7 +69,7 @@ public class ConcurrencyLimiterConfiguration {
      * ContextRefreshedEvent 在父子容器场景下可能触发多次，用 AtomicBoolean 保证幂等。
      */
     @Bean
-    public ApplicationListener<ContextRefreshedEvent> concurrencyLimiterRecoveryListener(ConcurrencyLimiterService limiterService, InstanceInfoRepository instanceInfoRepository) {
+    public ApplicationListener<ContextRefreshedEvent> concurrencyLimiterRecoveryListener(ConcurrencyLimiterService limiterService, InstanceInfoRepository instanceInfoRepository, AppInfoRepository appInfoRepository) {
         AtomicBoolean recovered = new AtomicBoolean(false);
         return event -> {
             if (!recovered.compareAndSet(false, true)) {
@@ -72,9 +78,22 @@ public class ConcurrencyLimiterConfiguration {
             try {
                 List<Integer> runningStatuses = Arrays.asList(InstanceStatus.WAITING_WORKER_RECEIVE.getV(), InstanceStatus.RUNNING.getV());
                 List<InstanceInfoDO> runningInstances = instanceInfoRepository.findByStatusIn(runningStatuses);
-                Map<Long, String> instanceWorkerMap = runningInstances.stream().collect(Collectors.toMap(InstanceInfoDO::getInstanceId, i -> StringUtils.defaultString(i.getTaskTrackerAddress(), "")));
-                log.info(">>>>>Power Job [并发限制器] 启动恢复: 找到 {} 运行实例:详情:{}", instanceWorkerMap.size(), instanceWorkerMap);
-                limiterService.recoverOnStartup(instanceWorkerMap);
+                Map<Long, String> instanceWorkerMap = runningInstances.stream()
+                        .collect(Collectors.toMap(InstanceInfoDO::getInstanceId, i -> StringUtils.defaultString(i.getTaskTrackerAddress(), "")));
+                Map<Long, Long> instanceAppMap = runningInstances.stream()
+                        .collect(HashMap::new, (m, i) -> m.put(i.getInstanceId(), i.getAppId() != null ? i.getAppId() : 0L), HashMap::putAll);
+                // 查询有 App 级限制的 appId
+                Set<Long> appIds = runningInstances.stream().map(InstanceInfoDO::getAppId).filter(id -> id != null).collect(Collectors.toSet());
+                Map<Long, Integer> appLimits = new HashMap<>();
+                if (!appIds.isEmpty()) {
+                    appInfoRepository.findAllById(appIds).forEach((AppInfoDO app) -> {
+                        if (app.getMaxConcurrency() != null && app.getMaxConcurrency() > 0) {
+                            appLimits.put(app.getId(), app.getMaxConcurrency());
+                        }
+                    });
+                }
+                log.info(">>>>>Power Job [并发限制器] 启动恢复: 找到 {} 运行实例, {} 个 App 配置了 App 级限制", instanceWorkerMap.size(), appLimits.size());
+                limiterService.recoverOnStartup(instanceWorkerMap, instanceAppMap, appLimits);
             } catch (Exception e) {
                 log.error(">>>>>Power Job [并发限制器] 启动恢复 失败", e);
             }

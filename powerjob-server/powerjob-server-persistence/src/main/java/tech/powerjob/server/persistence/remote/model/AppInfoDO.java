@@ -55,6 +55,11 @@ public class AppInfoDO {
      */
     private String extra;
 
+    /**
+     * App 级并发限制（null / 0 表示不设限，走 Server 全局限制；正整数表示该 App 同时运行的最大实例数）
+     */
+    private Integer maxConcurrency;
+
     private Date gmtCreate;
 
     private Date gmtModified;

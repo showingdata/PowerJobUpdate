@@ -16,7 +16,9 @@ import org.springframework.data.redis.core.SessionCallback;
 
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -28,30 +30,28 @@ import java.util.concurrent.TimeUnit;
  * 由 {@link ConcurrencyLimiterConfiguration} 统一装配
  * <p>
  * Key 设计（{pjcl} 为固定 hash tag，保证集群模式下所有 key 落同一 slot）：
- * pj:cl:{pjcl}:global:count          → 全局计数器（Integer）
- * pj:cl:{pjcl}:global:permits        → 持有全局许可的 instanceId 集合（Set）
- * pj:cl:{pjcl}:worker:{addr}:count   → 单 Worker 计数器（Integer）
- * pj:cl:{pjcl}:inst:{id}:worker      → instanceId 对应的 Worker 地址（String）
- * <p>
- * 原子性保证：所有 acquire/release 均通过 Lua 脚本在单次网络往返内完成，
- * 避免 INCR → 超限判断 → DECR 之间被其他节点抢占的竞态问题。
+ * pj:cl:{pjcl}:global:count          → Server 级全局计数器
+ * pj:cl:{pjcl}:global:permits        → Server 级持有许可的 instanceId 集合
+ * pj:cl:{pjcl}:app:{id}:count        → App 级计数器
+ * pj:cl:{pjcl}:app:{id}:permits      → App 级持有许可的 instanceId 集合
+ * pj:cl:{pjcl}:worker:{addr}:count   → 单 Worker 计数器
+ * pj:cl:{pjcl}:inst:{id}:worker      → instanceId 对应的 Worker 地址
+ * pj:cl:{pjcl}:inst:{id}:app         → instanceId 对应的 appId（仅 App 级限制实例才有）
  */
 @Slf4j
 @SuppressWarnings("all")
 public class RedisConcurrencyLimiterService implements ConcurrencyLimiterService {
 
-    // {pjcl} hash tag forces all keys onto the same Redis slot,
-    // making multi-key Lua scripts compatible with Redis Cluster / Sentinel / Standalone.
-    private static final String KEY_GLOBAL_COUNT = "pj:cl:{pjcl}:global:count";
+    private static final String KEY_GLOBAL_COUNT   = "pj:cl:{pjcl}:global:count";
     private static final String KEY_GLOBAL_PERMITS = "pj:cl:{pjcl}:global:permits";
-    private static final String KEY_WORKER_COUNT = "pj:cl:{pjcl}:worker:%s:count";
-    private static final String KEY_INST_WORKER = "pj:cl:{pjcl}:inst:%d:worker";
-    private static final String KEY_RECOVERY_LOCK = "pj:cl:{pjcl}:recovery:lock";
-    private static final long RECOVERY_LOCK_TTL_SECONDS = 60;
+    private static final String KEY_APP_COUNT      = "pj:cl:{pjcl}:app:%d:count";
+    private static final String KEY_APP_PERMITS    = "pj:cl:{pjcl}:app:%d:permits";
+    private static final String KEY_WORKER_COUNT   = "pj:cl:{pjcl}:worker:%s:count";
+    private static final String KEY_INST_WORKER    = "pj:cl:{pjcl}:inst:%d:worker";
+    private static final String KEY_INST_APP       = "pj:cl:{pjcl}:inst:%d:app";
+    private static final String KEY_RECOVERY_LOCK  = "pj:cl:{pjcl}:recovery:lock";
+    private static final long   RECOVERY_LOCK_TTL_SECONDS = 60;
 
-    /**
-     * 原子释放恢复锁：只删除自己持有的锁，避免 TTL 过期后误删他人锁
-     */
     private static final String SCRIPT_RELEASE_LOCK = ""
             + "if redis.call('GET', KEYS[1]) == ARGV[1] then "
             + "  return redis.call('DEL', KEYS[1]) "
@@ -59,15 +59,7 @@ public class RedisConcurrencyLimiterService implements ConcurrencyLimiterService
             + "  return 0 "
             + "end";
 
-    /**
-     * 原子 acquire 全局许可：
-     * 1. 幂等检查：instanceId 已在 permits 集合中 → 直接返回成功
-     * 2. INCR 计数器
-     * 3. 超限 → DECR 并返回 {0, current-1}
-     * 4. 正常 → SADD instanceId → 返回 {1, current}
-     * <p>
-     * 返回 List：[acquired(0/1), currentCount]
-     */
+    /** 原子 acquire Server 级全局许可（同原来逻辑，返回 [acquired, currentCount]） */
     private static final String SCRIPT_ACQUIRE_GLOBAL = ""
             + "local already = redis.call('SISMEMBER', KEYS[2], ARGV[1]) "
             + "if already == 1 then return {1, 0} end "
@@ -81,13 +73,39 @@ public class RedisConcurrencyLimiterService implements ConcurrencyLimiterService
             + "return {1, cur}";
 
     /**
-     * 原子 acquire Worker 许可：
-     * 0. 幂等检查：pj:cl:inst:{id}:worker 已存在 → 直接返回成功，避免重复计数
-     * 1. INCR worker 计数器
-     * 2. 超限 → DECR 并返回 {0, current-1}
-     * 3. 正常 → SET instWorkerKey（带 TTL 兜底 Server 崩溃后的 stale key）→ 返回 {1, current}
-     * ARGV: [max, workerAddress, ttlSeconds]
+     * 堆叠模式：原子 acquire App 级 + Server 级全局许可。
+     * KEYS: [app_count, app_permits, inst_app, global_count, global_permits]
+     * ARGV: [instanceId, maxAppConcurrency, appId, ttlSeconds, maxGlobalConcurrency]
+     * 返回 [acquired(0/1), currentCount, reason(-1=成功/幂等, 0=APP_LIMIT_EXCEEDED, 1=GLOBAL_LIMIT_EXCEEDED)]
      */
+    private static final String SCRIPT_ACQUIRE_APP_AND_GLOBAL = ""
+            + "local alreadyApp = redis.call('SISMEMBER', KEYS[2], ARGV[1]) "
+            + "if alreadyApp == 1 then return {1, 0, -1} end "
+            + "local appCur = redis.call('INCR', KEYS[1]) "
+            + "local maxApp = tonumber(ARGV[2]) "
+            + "if appCur > maxApp then "
+            + "  redis.call('DECR', KEYS[1]) "
+            + "  return {0, appCur - 1, 0} "
+            + "end "
+            + "redis.call('SADD', KEYS[2], ARGV[1]) "
+            + "local alreadyGlobal = redis.call('SISMEMBER', KEYS[5], ARGV[1]) "
+            + "if alreadyGlobal == 1 then "
+            + "  redis.call('SET', KEYS[3], ARGV[3], 'EX', ARGV[4]) "
+            + "  return {1, appCur, -1} "
+            + "end "
+            + "local globalCur = redis.call('INCR', KEYS[4]) "
+            + "local maxGlobal = tonumber(ARGV[5]) "
+            + "if globalCur > maxGlobal then "
+            + "  redis.call('DECR', KEYS[4]) "
+            + "  redis.call('SREM', KEYS[2], ARGV[1]) "
+            + "  redis.call('DECR', KEYS[1]) "
+            + "  return {0, globalCur - 1, 1} "
+            + "end "
+            + "redis.call('SADD', KEYS[5], ARGV[1]) "
+            + "redis.call('SET', KEYS[3], ARGV[3], 'EX', ARGV[4]) "
+            + "return {1, appCur, -1}";
+
+    /** 原子 acquire Worker 许可（同原来逻辑） */
     private static final String SCRIPT_ACQUIRE_WORKER = ""
             + "local existing = redis.call('GET', KEYS[2]) "
             + "if existing then return {1, 0} end "
@@ -101,12 +119,21 @@ public class RedisConcurrencyLimiterService implements ConcurrencyLimiterService
             + "return {1, cur}";
 
     /**
-     * 原子 release：
-     * 1. 移除全局 permits，若存在则 DECR 全局计数器
-     * 2. 若传入 workerAddress 为空，从映射 key 中取
-     * 3. DECR worker 计数器，删除映射 key
+     * 原子 release：释放 App 许可（如有）并释放全局许可，再释放 Worker 许可。
+     * 堆叠模式下 App 实例同时持有两个许可，两者都需归还。
+     * KEYS: [global_count, global_permits, inst_worker, inst_app]
+     * ARGV: [instanceId, workerAddress]
      */
     private static final String SCRIPT_RELEASE = ""
+            + "local appId = redis.call('GET', KEYS[4]) "
+            + "if appId and appId ~= false then "
+            + "  local appPermitsKey = 'pj:cl:{pjcl}:app:' .. appId .. ':permits' "
+            + "  local appCountKey   = 'pj:cl:{pjcl}:app:' .. appId .. ':count' "
+            + "  if redis.call('SREM', appPermitsKey, ARGV[1]) == 1 then "
+            + "    redis.call('DECR', appCountKey) "
+            + "  end "
+            + "  redis.call('DEL', KEYS[4]) "
+            + "end "
             + "if redis.call('SREM', KEYS[2], ARGV[1]) == 1 then "
             + "  redis.call('DECR', KEYS[1]) "
             + "end "
@@ -128,33 +155,28 @@ public class RedisConcurrencyLimiterService implements ConcurrencyLimiterService
     private final StringRedisTemplate redisTemplate;
 
     private final DefaultRedisScript<List> scriptAcquireGlobal;
+    private final DefaultRedisScript<List> scriptAcquireAppAndGlobal;
     private final DefaultRedisScript<List> scriptAcquireWorker;
-    private final DefaultRedisScript<Long> scriptRelease;
+    private final DefaultRedisScript<Long>  scriptRelease;
 
     public RedisConcurrencyLimiterService(ConcurrencyProperties props, StringRedisTemplate redisTemplate) {
         this.props = props;
         this.redisTemplate = redisTemplate;
-        scriptAcquireGlobal = new DefaultRedisScript<>(SCRIPT_ACQUIRE_GLOBAL, List.class);
-        scriptAcquireWorker = new DefaultRedisScript<>(SCRIPT_ACQUIRE_WORKER, List.class);
-        scriptRelease = new DefaultRedisScript<>(SCRIPT_RELEASE, Long.class);
+        scriptAcquireGlobal       = new DefaultRedisScript<>(SCRIPT_ACQUIRE_GLOBAL, List.class);
+        scriptAcquireAppAndGlobal = new DefaultRedisScript<>(SCRIPT_ACQUIRE_APP_AND_GLOBAL, List.class);
+        scriptAcquireWorker       = new DefaultRedisScript<>(SCRIPT_ACQUIRE_WORKER, List.class);
+        scriptRelease             = new DefaultRedisScript<>(SCRIPT_RELEASE, Long.class);
     }
 
-    /**
-     * 尝试获取全局并发许可
-     * <p>
-     * 通过 Lua 脚本原子性地完成以下操作：
-     * 1. 幂等检查：instanceId 已在 permits 集合中则直接返回成功
-     * 2. INCR 全局计数器
-     * 3. 超限则 DECR 计数器并返回拒绝
-     * 4. 未超限则将 instanceId 加入 permits 集合并返回成功
-     * <p>
-     * Redis 不可用时 fail-open，避免限流组件故障导致所有任务无法派发
-     *
-     * @param instanceId 任务实例 ID
-     * @return 并发许可（acquired 或 rejected）
-     */
     @Override
-    public ConcurrencyPermit tryAcquireGlobal(long instanceId) {
+    public ConcurrencyPermit tryAcquireGlobal(long appId, long instanceId, Integer appMaxConcurrency) {
+        if (appMaxConcurrency != null && appMaxConcurrency > 0) {
+            return tryAcquireAppAndGlobal(appId, instanceId, appMaxConcurrency);
+        }
+        return tryAcquireServerGlobal(instanceId);
+    }
+
+    private ConcurrencyPermit tryAcquireServerGlobal(long instanceId) {
         int max = props.getMaxGlobalConcurrency();
         List<String> keys = Arrays.asList(KEY_GLOBAL_COUNT, KEY_GLOBAL_PERMITS);
         try {
@@ -171,8 +193,41 @@ public class RedisConcurrencyLimiterService implements ConcurrencyLimiterService
             log.debug("[RedisConcurrencyLimiter] global permit acquired, instanceId={}, current={}/{}", instanceId, result.get(1), max);
             return ConcurrencyPermit.acquired(String.valueOf(instanceId));
         } catch (Exception e) {
-            // Redis 不可用时 fail-open，避免限流组件故障导致所有任务无法派发
             log.error("[RedisConcurrencyLimiter] tryAcquireGlobal failed, fail-open, instanceId={}", instanceId, e);
+            return ConcurrencyPermit.acquired(String.valueOf(instanceId));
+        }
+    }
+
+    private ConcurrencyPermit tryAcquireAppAndGlobal(long appId, long instanceId, int maxConcurrency) {
+        String appCountKey   = String.format(KEY_APP_COUNT, appId);
+        String appPermitsKey = String.format(KEY_APP_PERMITS, appId);
+        String instAppKey    = String.format(KEY_INST_APP, instanceId);
+        int maxGlobal        = props.getMaxGlobalConcurrency();
+        List<String> keys    = Arrays.asList(appCountKey, appPermitsKey, instAppKey, KEY_GLOBAL_COUNT, KEY_GLOBAL_PERMITS);
+        try {
+            List<Long> result = (List<Long>) redisTemplate.execute(scriptAcquireAppAndGlobal, keys,
+                    String.valueOf(instanceId), String.valueOf(maxConcurrency),
+                    String.valueOf(appId), String.valueOf(props.getInstWorkerKeyTtlSeconds()),
+                    String.valueOf(maxGlobal));
+            if (result == null) {
+                log.error("[RedisConcurrencyLimiter] tryAcquireAppAndGlobal got null result, fail-open, appId={}, instanceId={}", appId, instanceId);
+                return ConcurrencyPermit.acquired(String.valueOf(instanceId));
+            }
+            if (result.get(0) == 0L) {
+                int current = result.get(1).intValue();
+                int reason  = result.get(2).intValue();
+                if (reason == 0) {
+                    log.warn("[RedisConcurrencyLimiter] app[{}] limit exceeded, current={}, max={}, instanceId={}", appId, current, maxConcurrency, instanceId);
+                    return ConcurrencyPermit.rejected(OverLimitReason.APP_LIMIT_EXCEEDED, current, maxConcurrency);
+                } else {
+                    log.warn("[RedisConcurrencyLimiter] global limit exceeded (stacking), current={}, max={}, instanceId={}", current, maxGlobal, instanceId);
+                    return ConcurrencyPermit.rejected(OverLimitReason.GLOBAL_LIMIT_EXCEEDED, current, maxGlobal);
+                }
+            }
+            log.debug("[RedisConcurrencyLimiter] app[{}]+global permit acquired (stacking), instanceId={}, appCurrent={}/{}", appId, instanceId, result.get(1), maxConcurrency);
+            return ConcurrencyPermit.acquired(String.valueOf(instanceId));
+        } catch (Exception e) {
+            log.error("[RedisConcurrencyLimiter] tryAcquireAppAndGlobal failed, fail-open, appId={}, instanceId={}", appId, instanceId, e);
             return ConcurrencyPermit.acquired(String.valueOf(instanceId));
         }
     }
@@ -184,7 +239,7 @@ public class RedisConcurrencyLimiterService implements ConcurrencyLimiterService
             return ConcurrencyPermit.acquired(String.valueOf(instanceId));
         }
         String workerCountKey = String.format(KEY_WORKER_COUNT, workerAddress);
-        String instWorkerKey = String.format(KEY_INST_WORKER, instanceId);
+        String instWorkerKey  = String.format(KEY_INST_WORKER, instanceId);
         List<String> keys = Arrays.asList(workerCountKey, instWorkerKey);
         try {
             List<Long> result = (List<Long>) redisTemplate.execute(scriptAcquireWorker, keys, String.valueOf(max), workerAddress, String.valueOf(props.getInstWorkerKeyTtlSeconds()));
@@ -206,8 +261,21 @@ public class RedisConcurrencyLimiterService implements ConcurrencyLimiterService
     }
 
     @Override
-    public void recoverOnStartup(Map<Long, String> runningInstanceWorkerMap) {
-        // 分布式锁：防止多节点并发恢复导致计数互相覆盖
+    public void release(long instanceId, String workerAddress) {
+        String instWorkerKey = String.format(KEY_INST_WORKER, instanceId);
+        String instAppKey    = String.format(KEY_INST_APP, instanceId);
+        List<String> keys    = Arrays.asList(KEY_GLOBAL_COUNT, KEY_GLOBAL_PERMITS, instWorkerKey, instAppKey);
+        String addrArg = StringUtils.isNotEmpty(workerAddress) ? workerAddress : "";
+        try {
+            redisTemplate.execute(scriptRelease, keys, String.valueOf(instanceId), addrArg);
+            log.debug("[RedisConcurrencyLimiter] released, instanceId={}, workerAddress={}", instanceId, workerAddress);
+        } catch (Exception e) {
+            log.error("[RedisConcurrencyLimiter] release failed, instanceId={}, workerAddress={}", instanceId, workerAddress, e);
+        }
+    }
+
+    @Override
+    public void recoverOnStartup(Map<Long, String> runningInstanceWorkerMap, Map<Long, Long> instanceAppMap, Map<Long, Integer> appLimits) {
         String lockValue = UUID.randomUUID().toString();
         Boolean locked = redisTemplate.opsForValue().setIfAbsent(KEY_RECOVERY_LOCK, lockValue, RECOVERY_LOCK_TTL_SECONDS, TimeUnit.SECONDS);
         if (!Boolean.TRUE.equals(locked)) {
@@ -215,87 +283,109 @@ public class RedisConcurrencyLimiterService implements ConcurrencyLimiterService
             return;
         }
         try {
-            doRecover(runningInstanceWorkerMap);
+            doRecover(runningInstanceWorkerMap, instanceAppMap, appLimits);
         } finally {
-            // 原子 check-and-delete：只删除自己持有的锁
             DefaultRedisScript<Long> releaseLockScript = new DefaultRedisScript<>(SCRIPT_RELEASE_LOCK, Long.class);
             redisTemplate.execute(releaseLockScript, Collections.singletonList(KEY_RECOVERY_LOCK), lockValue);
         }
     }
 
-    private void doRecover(Map<Long, String> runningInstanceWorkerMap) {
+    private void doRecover(Map<Long, String> runningInstanceWorkerMap, Map<Long, Long> instanceAppMap, Map<Long, Integer> appLimits) {
         try {
-            int validCount = runningInstanceWorkerMap == null ? 0 : runningInstanceWorkerMap.size();
-
-            // Phase 1: SCAN 旧 Worker 计数 key（游标读取，必须在 MULTI 外完成）
+            // Phase 1: SCAN 旧 Worker 计数 key 和 App 计数 key（游标读取，必须在 MULTI 外完成）
             Set<String> oldWorkerCountKeys = new HashSet<>();
+            Set<String> oldAppCountKeys    = new HashSet<>();
+            Set<String> oldAppPermitKeys   = new HashSet<>();
             try (Cursor<String> cursor = redisTemplate.scan(
                     ScanOptions.scanOptions().match("pj:cl:{pjcl}:worker:*:count").count(100).build())) {
-                while (cursor.hasNext()) {
-                    oldWorkerCountKeys.add(cursor.next());
-                }
+                while (cursor.hasNext()) { oldWorkerCountKeys.add(cursor.next()); }
+            }
+            try (Cursor<String> cursor = redisTemplate.scan(
+                    ScanOptions.scanOptions().match("pj:cl:{pjcl}:app:*:count").count(100).build())) {
+                while (cursor.hasNext()) { oldAppCountKeys.add(cursor.next()); }
+            }
+            try (Cursor<String> cursor = redisTemplate.scan(
+                    ScanOptions.scanOptions().match("pj:cl:{pjcl}:app:*:permits").count(100).build())) {
+                while (cursor.hasNext()) { oldAppPermitKeys.add(cursor.next()); }
             }
 
-            // Phase 2: 预计算所有写入值（无 Redis I/O，MULTI 前备好数据）
-            String[] validIdArr = validCount > 0
-                    ? runningInstanceWorkerMap.keySet().stream().map(String::valueOf).toArray(String[]::new)
-                    : new String[0];
-            Map<String, Long> workerCountMap = new java.util.HashMap<>();
-            Map<Long, String> instWorkerEntries = new java.util.LinkedHashMap<>();
+            // Phase 2: 预计算写入值
+            // 堆叠模式：App 限制实例同时占用 app 桶和 global 桶
+            Map<Long, List<Long>> appInstanceMap = new HashMap<>();   // appId -> [instanceIds]
+            List<Long> globalInstanceIds = new java.util.ArrayList<>();
+            Map<Long, String> instWorkerEntries   = new LinkedHashMap<>();
+            Map<Long, String> instAppEntries      = new LinkedHashMap<>(); // 仅 app 级实例
+            Map<String, Long> workerCountMap      = new HashMap<>();
+
             if (runningInstanceWorkerMap != null) {
-                runningInstanceWorkerMap.forEach((id, addr) -> {
-                    if (StringUtils.isNotEmpty(addr)) {
-                        instWorkerEntries.put(id, addr);
-                        workerCountMap.merge(addr, 1L, Long::sum);
+                runningInstanceWorkerMap.forEach((instanceId, workerAddr) -> {
+                    Long appId = instanceAppMap != null ? instanceAppMap.get(instanceId) : null;
+                    boolean isAppLimited = appId != null && appLimits != null && appLimits.containsKey(appId);
+                    if (isAppLimited) {
+                        appInstanceMap.computeIfAbsent(appId, k -> new java.util.ArrayList<>()).add(instanceId);
+                        instAppEntries.put(instanceId, String.valueOf(appId));
+                    }
+                    // 堆叠模式：所有实例（包括 App 级）都占用 global 配额
+                    globalInstanceIds.add(instanceId);
+                    if (StringUtils.isNotEmpty(workerAddr)) {
+                        instWorkerEntries.put(instanceId, workerAddr);
+                        workerCountMap.merge(workerAddr, 1L, Long::sum);
                     }
                 });
             }
-            long ttl = props.getInstWorkerKeyTtlSeconds();
-            String globalCountStr = String.valueOf(validCount);
 
-            // Phase 3: 所有写操作在 MULTI/EXEC 中原子执行，消除写操作之间的竞态窗口
-            // SCAN → EXEC 之间仍有极短窗口，但 startup 场景并发压力极低，影响可接受
+            String[] globalIdArr = globalInstanceIds.stream().map(String::valueOf).toArray(String[]::new);
+            long ttl = props.getInstWorkerKeyTtlSeconds();
+
+            // Phase 3: MULTI/EXEC 原子写入
             redisTemplate.execute(new SessionCallback<Object>() {
                 @Override
                 public Object execute(RedisOperations operations) {
                     operations.multi();
-                    // 3a. 重建全局 permits set 和计数
+
+                    // 3a. 重建 Server 级 global permits & count
                     operations.delete(KEY_GLOBAL_PERMITS);
-                    if (validIdArr.length > 0) {
-                        operations.opsForSet().add(KEY_GLOBAL_PERMITS, validIdArr);
+                    if (globalIdArr.length > 0) {
+                        operations.opsForSet().add(KEY_GLOBAL_PERMITS, globalIdArr);
                     }
-                    operations.opsForValue().set(KEY_GLOBAL_COUNT, globalCountStr);
-                    // 3b. 清空旧 Worker 计数（与 3a 同批，不留中间状态）
-                    if (!oldWorkerCountKeys.isEmpty()) {
-                        operations.delete(oldWorkerCountKeys);
-                    }
-                    // 3c. 重建 instanceId → workerAddress 映射
+                    operations.opsForValue().set(KEY_GLOBAL_COUNT, String.valueOf(globalInstanceIds.size()));
+
+                    // 3b. 清空旧 Worker 计数
+                    if (!oldWorkerCountKeys.isEmpty()) { operations.delete(oldWorkerCountKeys); }
+
+                    // 3c. 清空旧 App 计数 & permits
+                    if (!oldAppCountKeys.isEmpty())  { operations.delete(oldAppCountKeys); }
+                    if (!oldAppPermitKeys.isEmpty()) { operations.delete(oldAppPermitKeys); }
+
+                    // 3d. 重建 App 级 permits & count
+                    appInstanceMap.forEach((appId, ids) -> {
+                        String appPermitsKey = String.format(KEY_APP_PERMITS, appId);
+                        String appCountKey   = String.format(KEY_APP_COUNT, appId);
+                        String[] idArr = ids.stream().map(String::valueOf).toArray(String[]::new);
+                        operations.opsForSet().add(appPermitsKey, idArr);
+                        operations.opsForValue().set(appCountKey, String.valueOf(ids.size()));
+                    });
+
+                    // 3e. 重建 instanceId -> workerAddress 映射
                     instWorkerEntries.forEach((id, addr) ->
                             operations.opsForValue().set(String.format(KEY_INST_WORKER, id), addr, ttl, TimeUnit.SECONDS));
-                    // 3d. 重建 Worker 计数
+
+                    // 3f. 重建 instanceId -> appId 映射（仅 app 级实例）
+                    instAppEntries.forEach((id, appIdStr) ->
+                            operations.opsForValue().set(String.format(KEY_INST_APP, id), appIdStr, ttl, TimeUnit.SECONDS));
+
+                    // 3g. 重建 Worker 计数
                     workerCountMap.forEach((addr, count) ->
                             operations.opsForValue().set(String.format(KEY_WORKER_COUNT, addr), String.valueOf(count)));
+
                     return operations.exec();
                 }
             });
 
-            log.info("[RedisConcurrencyLimiter] startup recovery done, globalCount={}", validCount);
+            log.info("[RedisConcurrencyLimiter] startup recovery done, globalCount={}, appBuckets={}",
+                    globalInstanceIds.size(), appInstanceMap.size());
         } catch (Exception e) {
             log.error("[RedisConcurrencyLimiter] startup recovery failed, skip", e);
-        }
-    }
-
-    @Override
-    public void release(long instanceId, String workerAddress) {
-        String instWorkerKey = String.format(KEY_INST_WORKER, instanceId);
-        List<String> keys = Arrays.asList(KEY_GLOBAL_COUNT, KEY_GLOBAL_PERMITS, instWorkerKey);
-        String addrArg = StringUtils.isNotEmpty(workerAddress) ? workerAddress : "";
-        try {
-            redisTemplate.execute(scriptRelease, keys, String.valueOf(instanceId), addrArg);
-            log.debug("[RedisConcurrencyLimiter] released, instanceId={}, workerAddress={}", instanceId, workerAddress);
-        } catch (Exception e) {
-            // release 失败只记录日志，不影响主流程
-            log.error("[RedisConcurrencyLimiter] release failed, instanceId={}, workerAddress={}", instanceId, workerAddress, e);
         }
     }
 }

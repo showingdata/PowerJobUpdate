@@ -306,12 +306,10 @@ public class InstanceStatusCheckService {
         instanceInfoRepository.saveAndFlush(instance);
 
         instanceManager.processFinishedInstance(instance.getInstanceId(), instance.getWfInstanceId(), InstanceStatus.FAILED, result);
-
         // WAITING_DISPATCH 超时被判定为失败时，preDispatch 可能已通知 Worker 完成 preLoad，
         // 若不主动取消，Worker 侧资源将永远无法释放（best-effort：失败只记日志）
         if (savedPreScheduledWorker != null && !savedPreScheduledWorker.isEmpty()) {
-            jobInfoRepository.findById(instance.getJobId())
-                    .ifPresent(jobInfo -> dispatchService.cancelPreLoadByAddress(jobInfo, instance, savedPreScheduledWorker));
+            jobInfoRepository.findById(instance.getJobId()).ifPresent(jobInfo -> dispatchService.cancelPreLoadByAddress(jobInfo, instance, savedPreScheduledWorker));
         }
     }
 }

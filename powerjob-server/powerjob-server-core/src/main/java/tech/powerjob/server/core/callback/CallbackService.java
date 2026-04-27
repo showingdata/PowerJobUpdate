@@ -6,7 +6,6 @@ import okhttp3.*;
 import org.apache.commons.lang3.StringUtils;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.stereotype.Service;
-import tech.powerjob.common.enums.CallbackEventType;
 import tech.powerjob.common.model.CallbackNotification;
 import tech.powerjob.server.common.constants.CallbackProperties;
 import tech.powerjob.server.persistence.remote.model.CallbackEndpointDO;
@@ -34,6 +33,7 @@ import java.util.concurrent.*;
  */
 @Slf4j
 @Service
+@SuppressWarnings("unchecked")
 @ConditionalOnProperty(name = "powerjob.server.callback.enabled", havingValue = "true")
 public class CallbackService {
 
@@ -56,13 +56,11 @@ public class CallbackService {
 
     @PostConstruct
     public void init() {
-        log.info("初始化 回调通知服务 HTTP Client");
         httpClient = new OkHttpClient.Builder()
                 .connectTimeout(props.getDefaultTimeoutMs(), TimeUnit.MILLISECONDS)
                 .readTimeout(props.getDefaultTimeoutMs(), TimeUnit.MILLISECONDS)
                 .writeTimeout(props.getDefaultTimeoutMs(), TimeUnit.MILLISECONDS)
                 .build();
-
         executor = new ThreadPoolExecutor(
                 props.getThreadPoolSize(),
                 props.getThreadPoolSize(),
@@ -71,7 +69,7 @@ public class CallbackService {
                 r -> new Thread(r, "callback-sender"),
                 new ThreadPoolExecutor.CallerRunsPolicy()
         );
-        log.info("初始化 回调通知服务 HTTP Client [CallbackService] initialized, threadPool={}, timeout={}ms, queue={}", props.getThreadPoolSize(), props.getDefaultTimeoutMs(), props.getQueueSize());
+        log.info(" HTTP Client [CallbackService] initialized, threadPool={}, timeout={}ms, queue={}", props.getThreadPoolSize(), props.getDefaultTimeoutMs(), props.getQueueSize());
     }
 
     @PreDestroy
@@ -138,19 +136,14 @@ public class CallbackService {
                 // 解析自定义请求头
                 parseHeaders(endpoint.getHeaders()).forEach(reqBuilder::addHeader);
 
-                OkHttpClient clientWithTimeout = httpClient.newBuilder()
-                        .callTimeout(timeoutMs, TimeUnit.MILLISECONDS)
-                        .build();
+                OkHttpClient clientWithTimeout = httpClient.newBuilder().callTimeout(timeoutMs, TimeUnit.MILLISECONDS).build();
 
                 try (Response response = clientWithTimeout.newCall(reqBuilder.build()).execute()) {
                     int code = response.code();
                     String respBody = response.body() != null ? response.body().string() : "";
                     boolean success = response.isSuccessful();
 
-                    callbackLog.setResponseStatus(code)
-                            .setResponseBody(StringUtils.left(respBody, 2000))
-                            .setSuccess(success ? 1 : 0)
-                            .setCostMs((int) (System.currentTimeMillis() - start));
+                    callbackLog.setResponseStatus(code).setResponseBody(StringUtils.left(respBody, 2000)).setSuccess(success ? 1 : 0).setCostMs((int) (System.currentTimeMillis() - start));
 
                     logRepository.save(callbackLog);
 
@@ -158,18 +151,13 @@ public class CallbackService {
                         log.debug("[CallbackService] send success, traceId={}, endpoint={}, attempt={}", traceId, endpoint.getCallbackUrl(), attempt);
                         return;
                     }
-                    log.warn("[CallbackService] send failed, traceId={}, endpoint={}, status={}, attempt={}/{}",
-                            traceId, endpoint.getCallbackUrl(), code, attempt, maxRetry);
+                    log.warn("[CallbackService] send failed, traceId={}, endpoint={}, status={}, attempt={}/{}", traceId, endpoint.getCallbackUrl(), code, attempt, maxRetry);
                 }
             } catch (Exception e) {
-                callbackLog.setSuccess(0)
-                        .setErrorMsg(StringUtils.left(e.getMessage(), 1000))
-                        .setCostMs((int) (System.currentTimeMillis() - start));
+                callbackLog.setSuccess(0).setErrorMsg(StringUtils.left(e.getMessage(), 1000)).setCostMs((int) (System.currentTimeMillis() - start));
                 logRepository.save(callbackLog);
-                log.warn("[CallbackService] send error, traceId={}, endpoint={}, attempt={}/{}, error={}",
-                        traceId, endpoint.getCallbackUrl(), attempt, maxRetry, e.getMessage());
+                log.warn("[CallbackService] send error, traceId={}, endpoint={}, attempt={}/{}, error={}", traceId, endpoint.getCallbackUrl(), attempt, maxRetry, e.getMessage());
             }
-
             // 重试前等待（指数退避，最多 8 秒）
             if (attempt < maxRetry) {
                 try {
@@ -183,7 +171,7 @@ public class CallbackService {
         log.error("[CallbackService] all retries exhausted, traceId={}, endpoint={}", traceId, endpoint.getCallbackUrl());
     }
 
-    @SuppressWarnings("unchecked")
+
     private Map<String, String> parseHeaders(String headersJson) {
         if (StringUtils.isBlank(headersJson)) {
             return Collections.emptyMap();

@@ -25,8 +25,10 @@ import tech.powerjob.server.core.instance.InstanceManager;
 import tech.powerjob.server.core.instance.InstanceMetadataService;
 import tech.powerjob.server.core.lock.UseCacheLock;
 import tech.powerjob.server.extension.ConcurrencyLimiterService;
+import tech.powerjob.server.persistence.remote.model.AppInfoDO;
 import tech.powerjob.server.persistence.remote.model.InstanceInfoDO;
 import tech.powerjob.server.persistence.remote.model.JobInfoDO;
+import tech.powerjob.server.persistence.remote.repository.AppInfoRepository;
 import tech.powerjob.server.persistence.remote.repository.InstanceInfoRepository;
 import tech.powerjob.server.remote.transporter.TransportService;
 import tech.powerjob.server.remote.transporter.impl.ServerURLFactory;
@@ -63,6 +65,8 @@ public class DispatchService {
     private final InstanceMetadataService instanceMetadataService;
 
     private final InstanceInfoRepository instanceInfoRepository;
+
+    private final AppInfoRepository appInfoRepository;
 
     private final TaskTrackerSelectorService taskTrackerSelectorService;
 
@@ -264,7 +268,8 @@ public class DispatchService {
             overloadOptional.ifPresent(booleanHolder -> booleanHolder.set(true));
             log.warn("[Dispatcher-{}|{}] cancel to dispatch job due to all worker is overload", jobId, instanceId);
             // 此处无需 release：全局许可尚未 acquire，无需归还
-            // 所有 Worker 超载时实例停留在 WAITING_DISPATCH 等待下次重试，preLoad 资源需主动释放（best-effort）
+            // TODO所有 Worker 超载时实例停留在 WAITING_DISPATCH 等待下次重试，preLoad 资源需主动释放（best-effort）
+            // TODO 需要预加载功能时候触发
             tryCancelPreLoad(jobInfo, instanceInfo);
             // 回调通知
             if (callbackService != null) {
@@ -283,7 +288,8 @@ public class DispatchService {
         }
         // 确认有可用 Worker 后再获取全局并发许可，避免无 Worker 时的无效 acquire/release
         if (concurrencyLimiterService != null) {
-            ConcurrencyPermit globalPermit = concurrencyLimiterService.tryAcquireGlobal(instanceId);
+            Integer appMaxConcurrency = appInfoRepository.findById(instanceInfo.getAppId()).map(AppInfoDO::getMaxConcurrency).orElse(null);
+            ConcurrencyPermit globalPermit = concurrencyLimiterService.tryAcquireGlobal(instanceInfo.getAppId(), instanceId, appMaxConcurrency);
             if (!globalPermit.isAcquired()) {
                 handleOverLimit(jobInfo, instanceId, instanceInfo, globalPermit, now, current);
                 return;
@@ -367,7 +373,8 @@ public class DispatchService {
             // 实例真正进入终态才发回调
             if (callbackService != null) {
                 try {
-                    CallbackEventType eventType = permit.getReason() == OverLimitReason.GLOBAL_LIMIT_EXCEEDED ? CallbackEventType.GLOBAL_LIMIT_EXCEEDED : CallbackEventType.TASK_REJECTED;
+                    CallbackEventType eventType = (permit.getReason() == OverLimitReason.GLOBAL_LIMIT_EXCEEDED || permit.getReason() == OverLimitReason.APP_LIMIT_EXCEEDED)
+                            ? CallbackEventType.GLOBAL_LIMIT_EXCEEDED : CallbackEventType.TASK_REJECTED;
                     CallbackNotification notification = CallbackNotification.create(eventType, reason)
                             .setAppId(instanceInfo.getAppId())
                             .setJobId(jobInfo.getId())
@@ -535,6 +542,58 @@ public class DispatchService {
         if (jobInfo.getInstanceTimeLimit() != null) {
             req.setInstanceTimeoutMS(jobInfo.getInstanceTimeLimit());
         }
+        /**
+         * 我这里为什么要单独强调一下 concurrency 这个参数
+         *
+         * Job 配置（数据库 job_info.concurrency）
+         *     → Server 调度时打包进 ServerScheduleJobReq.threadConcurrency
+         *     → Worker 收到后 TaskTracker 构造时存入 InstanceInfo.threadConcurrency
+         *     → ProcessorTracker 初始化时读取，决定线程池大小
+         *
+         * 这个参数是在 Job 创建/编辑时配置的，不是 TaskTracker 运行时动态指定的
+         * 实际含义：每台 Worker 机器上，ProcessorTracker 的工作线程池大小，即单台机器同时并发执行子任务的线程数
+         * 生效场景（ProcessorTracker.calThreadPoolSize()，:代码330）
+         * {@link tech.powerjob.worker.core.tracker.processor.ProcessorTracker#calThreadPoolSize()}
+         * 还有一处用法（HeavyTaskTracker :482）
+         * long maxDispatchNum = availablePtIps.size() * instanceInfo.getThreadConcurrency() * 2L;
+         * {@link tech.powerjob.worker.core.tracker.task.heavy.HeavyTaskTracker#}
+         *   控制 TaskTracker 每轮调度最多往所有 Worker 派发多少子任务，防止一次性堆满所有人的队列
+         *   举个例子：
+         *   MR 任务，3 台 Worker，threadConcurrency=10：
+         *   - 每台 Worker 的 ProcessorTracker 用 10 个线程并发跑子任务
+         *   - 全集群最多同时执行 3 × 10 = 30 个子任务
+         *   - 每轮 TaskTracker 最多派发 3 × 10 × 2 = 60 个子任务
+         *
+         *   INFOQ: 那和我们设计的全局并发有什么冲突么？？？
+         *   Server 调度层
+         *   ┌─────────────────────────────────────────────────────────  ┐
+         *   │  我们实现的全局并发限制                                     │
+         *   │  maxGlobalConcurrency  ←── 限制同时运行的 Instance 总数    │
+         *   │  maxWorkerConcurrency  ←── 限制单个 Worker 承载的 Instance │
+         *   │  maxConcurrency(App级) ←── 限制某个 App 的 Instance 总数  │
+         *   └──────────────────────┬──────────────────────────────────┘
+         *                          │ 派发一个 Instance
+         *                          ↓
+         *   Worker 执行层（单个 Instance 内部）
+         *   ┌─────────────────────────────────────────────────────────┐
+         *   │  threadConcurrency                                       │
+         *   │  ←── 限制 ProcessorTracker 线程池大小                    │
+         *   │  ←── 控制这个 Instance 在每台机器上同时跑多少个子任务       │
+         *   └─────────────────────────────────────────────────────────┘
+         *
+         *   我们控制的是：允许多少个 Instance 同时存在。
+         *
+         *   threadConcurrency 控制的是：一个 Instance 内部，每台 Worker 开多少线程跑子任务。
+         *    一个具体例子说明两者协同工作：
+         *   配置：
+         *     maxGlobalConcurrency = 10     → 最多同时运行 10 个 Instance
+         *     threadConcurrency = 20        → 每个 Instance 在每台 Worker 上用 20 个线程
+         *     Worker 节点数 = 3
+         *   实际效果：
+         *     同时最多 10 个 Instance 在跑（我们的限制）
+         *     每个 Instance 最多占用 3 × 20 = 60 个线程（threadConcurrency 的控制）
+         *     峰值总线程数 ≈ 10 × 60 = 600
+         */
         req.setThreadConcurrency(jobInfo.getConcurrency());
         return req;
     }
